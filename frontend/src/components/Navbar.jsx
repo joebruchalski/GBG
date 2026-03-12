@@ -1,4 +1,4 @@
-import { Truck, Map, Users, MapPin } from 'lucide-react'
+import { Truck, Map, MapPin, LogOut } from 'lucide-react'
 
 const tabs = [
   { id: 'map', label: 'Routes', icon: Map },
@@ -6,7 +6,7 @@ const tabs = [
   { id: 'stops', label: 'Stops', icon: MapPin },
 ]
 
-export default function Navbar({ tab, setTab }) {
+export default function Navbar({ tab, setTab, user, onLogout }) {
   return (
     <nav className="bg-white border-b border-gray-200 px-4 flex items-center h-14 gap-1 shrink-0">
       <div className="flex items-center gap-2 mr-6">
@@ -14,9 +14,10 @@ export default function Navbar({ tab, setTab }) {
           <Truck size={18} className="text-white" />
         </div>
         <span className="font-bold text-gray-900 text-lg tracking-tight">
-          Route Optimizer
+          FleetPilot
         </span>
       </div>
+
       {tabs.map(({ id, label, icon: Icon }) => (
         <button
           key={id}
@@ -31,6 +32,26 @@ export default function Navbar({ tab, setTab }) {
           {label}
         </button>
       ))}
+
+      {/* Spacer */}
+      <div className="flex-1" />
+
+      {/* User + logout */}
+      {user && (
+        <div className="flex items-center gap-3">
+          <span className="text-sm text-gray-600 hidden sm:block">
+            {user.name}
+          </span>
+          <button
+            onClick={onLogout}
+            title="Sign out"
+            className="flex items-center gap-1.5 text-sm text-gray-500 hover:text-red-600 hover:bg-red-50 px-2.5 py-1.5 rounded-md transition-colors"
+          >
+            <LogOut size={15} />
+            <span className="hidden sm:block">Sign out</span>
+          </button>
+        </div>
+      )}
     </nav>
   )
 }

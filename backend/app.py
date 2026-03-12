@@ -5,11 +5,18 @@ GBG Fleet Route Optimizer — Flask Backend API
 import json
 import os
 import requests as http_requests
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
+from flask_jwt_extended import (
+    JWTManager,
+    create_access_token,
+    jwt_required,
+    get_jwt_identity,
+)
 from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import check_password_hash, generate_password_hash
 
 from optimization.scheduler import (
     Location,
@@ -25,8 +32,11 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-key")
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///gbg_routes.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET_KEY", "jwt-dev-secret-change-in-prod")
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(days=7)
 
 db = SQLAlchemy(app)
+JWTManager(app)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 
@@ -107,6 +117,18 @@ class OptimizationRun(db.Model):
     num_stops = db.Column(db.Integer)
 
 
+class User(db.Model):
+    __tablename__ = "users"
+    id = db.Column(db.String(50), primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    email = db.Column(db.String(100), unique=True, nullable=False)
+    password_hash = db.Column(db.String(256), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {"id": self.id, "name": self.name, "email": self.email}
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
@@ -114,10 +136,64 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
 
 
+# ── Routes: Auth ─────────────────────────────────────────────────────────────
+
+
+@app.route("/api/auth/register", methods=["POST"])
+def register():
+    data = request.json or {}
+    name = data.get("name", "").strip()
+    email = data.get("email", "").strip().lower()
+    password = data.get("password", "")
+
+    if not name or not email or not password:
+        return jsonify({"error": "Name, email, and password are required"}), 400
+    if len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
+    if User.query.filter_by(email=email).first():
+        return jsonify({"error": "An account with that email already exists"}), 409
+
+    user = User(
+        id=_new_id("U"),
+        name=name,
+        email=email,
+        password_hash=generate_password_hash(password),
+    )
+    db.session.add(user)
+    db.session.commit()
+
+    token = create_access_token(identity=user.id)
+    return jsonify({"token": token, "user": user.to_dict()}), 201
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def login():
+    data = request.json or {}
+    email = data.get("email", "").strip().lower()
+    password = data.get("password", "")
+
+    user = User.query.filter_by(email=email).first()
+    if not user or not check_password_hash(user.password_hash, password):
+        return jsonify({"error": "Invalid email or password"}), 401
+
+    token = create_access_token(identity=user.id)
+    return jsonify({"token": token, "user": user.to_dict()})
+
+
+@app.route("/api/auth/me", methods=["GET"])
+@jwt_required()
+def get_me():
+    user = db.session.get(User, get_jwt_identity())
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    return jsonify(user.to_dict())
+
+
 # ── Routes: Geocoding ─────────────────────────────────────────────────────────
 
 
 @app.route("/api/geocode", methods=["POST"])
+@jwt_required()
 def geocode():
     address = (request.json or {}).get("address", "").strip()
     if not address:
@@ -147,12 +223,14 @@ def geocode():
 
 
 @app.route("/api/depot", methods=["GET"])
+@jwt_required()
 def get_depot():
     depot = Depot.query.first()
     return jsonify(depot.to_dict() if depot else None)
 
 
 @app.route("/api/depot", methods=["POST"])
+@jwt_required()
 def set_depot():
     data = request.json or {}
     depot = Depot.query.first()
@@ -175,12 +253,14 @@ def set_depot():
 
 
 @app.route("/api/vehicles", methods=["GET"])
+@jwt_required()
 def get_vehicles():
     vehicles = Vehicle.query.filter_by(active=True).order_by(Vehicle.created_at).all()
     return jsonify([v.to_dict() for v in vehicles])
 
 
 @app.route("/api/vehicles", methods=["POST"])
+@jwt_required()
 def create_vehicle():
     data = request.json or {}
     v = Vehicle(
@@ -198,6 +278,7 @@ def create_vehicle():
 
 
 @app.route("/api/vehicles/<vid>", methods=["PUT"])
+@jwt_required()
 def update_vehicle(vid):
     v = db.session.get(Vehicle, vid)
     if not v:
@@ -219,6 +300,7 @@ def update_vehicle(vid):
 
 
 @app.route("/api/vehicles/<vid>", methods=["DELETE"])
+@jwt_required()
 def delete_vehicle(vid):
     v = db.session.get(Vehicle, vid)
     if not v:
@@ -232,6 +314,7 @@ def delete_vehicle(vid):
 
 
 @app.route("/api/stops", methods=["GET"])
+@jwt_required()
 def get_stops():
     stops = (
         DeliveryStop.query.filter_by(active=True)
@@ -242,6 +325,7 @@ def get_stops():
 
 
 @app.route("/api/stops", methods=["POST"])
+@jwt_required()
 def create_stop():
     data = request.json or {}
     s = DeliveryStop(
@@ -258,6 +342,7 @@ def create_stop():
 
 
 @app.route("/api/stops/<sid>", methods=["DELETE"])
+@jwt_required()
 def delete_stop(sid):
     s = db.session.get(DeliveryStop, sid)
     if not s:
@@ -271,6 +356,7 @@ def delete_stop(sid):
 
 
 @app.route("/api/optimize", methods=["POST"])
+@jwt_required()
 def run_optimization():
     data = request.json or {}
 
@@ -367,6 +453,7 @@ def run_optimization():
 
 
 @app.route("/api/optimize/save", methods=["POST"])
+@jwt_required()
 def save_optimization():
     """Persist a route plan and increment each vehicle's odometer."""
     data = request.json or {}
@@ -394,6 +481,7 @@ def save_optimization():
 
 
 @app.route("/api/stats", methods=["GET"])
+@jwt_required()
 def get_stats():
     vehicles = Vehicle.query.filter_by(active=True).all()
     num_stops = DeliveryStop.query.filter_by(active=True).count()
@@ -416,6 +504,22 @@ def get_stats():
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"status": "healthy", "timestamp": datetime.utcnow().isoformat()})
+
+
+# ── Serve React frontend (production) ────────────────────────────────────────
+
+FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
+
+
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def serve_frontend(path):
+    """Serve the built React app for any non-API route."""
+    dist = os.path.abspath(FRONTEND_DIST)
+    target = os.path.join(dist, path)
+    if path and os.path.exists(target) and os.path.isfile(target):
+        return send_from_directory(dist, path)
+    return send_from_directory(dist, "index.html")
 
 
 # ── Init ──────────────────────────────────────────────────────────────────────
