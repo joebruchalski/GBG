@@ -5,9 +5,11 @@ import Fleet from './components/Fleet'
 import Stops from './components/Stops'
 import LoginPage from './components/LoginPage'
 import LandingPage from './components/LandingPage'
+import AboutPage from './components/AboutPage'
+import PricingPage from './components/PricingPage'
 import { getToken, clearToken, getMe, getDepot, getVehicles, getStops } from './api'
 
-// view: 'loading' | 'landing' | 'login' | 'app'
+// view: 'loading' | 'landing' | 'about' | 'pricing' | 'login' | 'app'
 
 export default function App() {
   const [view, setView] = useState('loading')
@@ -88,9 +90,14 @@ export default function App() {
     )
   }
 
-  if (view === 'landing') {
-    return <LandingPage onSignIn={() => setView('login')} />
+  const marketingProps = {
+    onSignIn: () => setView('login'),
+    onNavigate: setView,
   }
+
+  if (view === 'landing') return <LandingPage {...marketingProps} />
+  if (view === 'about')   return <AboutPage   {...marketingProps} />
+  if (view === 'pricing') return <PricingPage {...marketingProps} />
 
   if (view === 'login') {
     return <LoginPage onAuth={handleAuth} onBack={() => setView('landing')} />

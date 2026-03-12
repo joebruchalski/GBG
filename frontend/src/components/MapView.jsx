@@ -359,12 +359,12 @@ export default function MapView({
             </Marker>
           )}
 
-          {/* Route polylines (depot → stops → depot) */}
+          {/* Route polylines — real road geometry when available, straight-line fallback */}
           {optimizationResult &&
             optimizationResult.routes.map((route, vi) => {
               if (!route.stops.length) return null
               const color = ROUTE_COLORS[vi % ROUTE_COLORS.length]
-              const positions = [
+              const positions = route.routeGeometry || [
                 [optimizationResult.depot.lat, optimizationResult.depot.lng],
                 ...route.stops.map((s) => [s.latitude, s.longitude]),
                 [optimizationResult.depot.lat, optimizationResult.depot.lng],

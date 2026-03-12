@@ -69,6 +69,7 @@ def optimize_routes(
     stops: List[Stop],
     vehicles: List[Vehicle],
     max_search_seconds: int = 30,
+    road_distance_matrix: np.ndarray = None,
 ) -> List[RouteResult]:
     """
     Optimize delivery routes across the fleet.
@@ -77,12 +78,15 @@ def optimize_routes(
     actively minimizes the gap between the longest and shortest route, spreading
     wear evenly across vehicles.
 
+    road_distance_matrix: optional integer (meters) matrix from OSRM. When
+    provided, the optimizer uses real road distances instead of haversine.
+
     Returns one RouteResult per vehicle (stop_ids may be empty if unneeded).
     """
     if not stops or not vehicles:
         return []
 
-    dist_mat = _build_distance_matrix(depot, stops)
+    dist_mat = road_distance_matrix if road_distance_matrix is not None else _build_distance_matrix(depot, stops)
     n_nodes = len(dist_mat)
     num_vehicles = len(vehicles)
 

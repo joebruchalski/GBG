@@ -4,6 +4,7 @@ GBG Fleet Route Optimizer — Flask Backend API
 
 import json
 import os
+import numpy as np
 import requests as http_requests
 from datetime import datetime, timedelta
 
@@ -134,6 +135,60 @@ class User(db.Model):
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
+
+
+# ── OSRM road-routing helpers ─────────────────────────────────────────────────
+
+OSRM_BASE = "http://router.project-osrm.org"
+METERS_TO_MILES = 0.000621371
+
+
+def _osrm_table(locs: list):
+    """
+    Fetch a real-road distance matrix (meters, integers) from the OSRM Table API.
+    locs: list of dicts with 'lat' and 'lng'.
+    Returns an ndarray or None on failure.
+    """
+    coords = ";".join(f"{p['lng']},{p['lat']}" for p in locs)
+    try:
+        resp = http_requests.get(
+            f"{OSRM_BASE}/table/v1/driving/{coords}",
+            params={"annotations": "distance"},
+            timeout=15,
+        )
+        data = resp.json()
+        if data.get("code") == "Ok" and "distances" in data:
+            return np.array(data["distances"], dtype="int64")
+    except Exception as e:
+        app.logger.warning(f"OSRM table failed: {e}")
+    return None
+
+
+def _osrm_route(locs: list):
+    """
+    Fetch the road geometry and real distance/duration for an ordered list of locs.
+    locs: list of dicts with 'lat' and 'lng'.
+    Returns (geometry_latlon, distance_miles, duration_minutes) or (None, None, None).
+    geometry_latlon: list of [lat, lng] — ready for Leaflet Polyline.
+    """
+    coords = ";".join(f"{p['lng']},{p['lat']}" for p in locs)
+    try:
+        resp = http_requests.get(
+            f"{OSRM_BASE}/route/v1/driving/{coords}",
+            params={"geometries": "geojson", "overview": "full"},
+            timeout=15,
+        )
+        data = resp.json()
+        if data.get("code") == "Ok":
+            route = data["routes"][0]
+            # GeoJSON coords are [lng, lat] — flip to [lat, lng] for Leaflet
+            geometry = [[c[1], c[0]] for c in route["geometry"]["coordinates"]]
+            dist_miles = round(route["distance"] * METERS_TO_MILES, 2)
+            dur_minutes = int(route["duration"] / 60)
+            return geometry, dist_miles, dur_minutes
+    except Exception as e:
+        app.logger.warning(f"OSRM route failed: {e}")
+    return None, None, None
 
 
 # ── Routes: Auth ─────────────────────────────────────────────────────────────
@@ -387,6 +442,7 @@ def run_optimization():
         return jsonify({"error": "No delivery stops found"}), 400
 
     depot_loc = Location(lat=depot.latitude, lng=depot.longitude)
+    depot_dict = {"lat": depot.latitude, "lng": depot.longitude}
     opt_vehicles = [
         OptVehicle(id=v.id, name=v.name, capacity=v.capacity) for v in db_vehicles
     ]
@@ -395,8 +451,14 @@ def run_optimization():
         for s in db_stops
     ]
 
+    # Build real-road distance matrix via OSRM (falls back to haversine if unavailable)
+    all_locs = [depot_dict] + [{"lat": s.latitude, "lng": s.longitude} for s in db_stops]
+    road_matrix = _osrm_table(all_locs)
+
     results: list[RouteResult] = optimize_routes(
-        depot_loc, opt_stops, opt_vehicles, max_search_seconds=30
+        depot_loc, opt_stops, opt_vehicles,
+        max_search_seconds=30,
+        road_distance_matrix=road_matrix,
     )
 
     if not results:
@@ -422,10 +484,27 @@ def run_optimization():
             for i, sid in enumerate(r.stop_ids)
             if sid in stop_map
         ]
-        fuel_gallons = (
-            round(r.total_distance_miles / v.mpg, 2) if v.mpg else None
-        )
-        total_fleet_miles += r.total_distance_miles
+
+        # Fetch road geometry + accurate distance/time for this vehicle's route
+        route_geometry = None
+        route_miles = r.total_distance_miles
+        route_minutes = r.estimated_minutes
+
+        if r.stop_ids:
+            ordered_locs = [depot_dict]
+            for sid in r.stop_ids:
+                if sid in stop_map:
+                    s = stop_map[sid]
+                    ordered_locs.append({"lat": s.latitude, "lng": s.longitude})
+            ordered_locs.append(depot_dict)
+            geo, miles, minutes = _osrm_route(ordered_locs)
+            if geo is not None:
+                route_geometry = geo
+                route_miles = miles
+                route_minutes = minutes
+
+        fuel_gallons = round(route_miles / v.mpg, 2) if v.mpg else None
+        total_fleet_miles += route_miles
         routes.append(
             {
                 "vehicleId": r.vehicle_id,
@@ -433,11 +512,12 @@ def run_optimization():
                 "licensePlate": v.license_plate,
                 "mpg": v.mpg,
                 "stops": stops_detail,
-                "totalDistanceMiles": r.total_distance_miles,
-                "totalDistanceKm": r.total_distance_km,
-                "estimatedMinutes": r.estimated_minutes,
-                "estimatedHours": round(r.estimated_minutes / 60, 2),
+                "totalDistanceMiles": route_miles,
+                "totalDistanceKm": round(route_miles / 0.621371, 2),
+                "estimatedMinutes": route_minutes,
+                "estimatedHours": round(route_minutes / 60, 2),
                 "fuelGallons": fuel_gallons,
+                "routeGeometry": route_geometry,
             }
         )
 
