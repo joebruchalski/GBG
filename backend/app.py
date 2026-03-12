@@ -1,376 +1,439 @@
 """
-Main Flask Application for GBG Field Service API
+GBG Fleet Route Optimizer — Flask Backend API
 """
 
+import json
 import os
+import requests as http_requests
+from datetime import datetime
+
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
-from datetime import datetime
-import logging
 
 from optimization.scheduler import (
-    RouteOptimizer, ServiceCall, Technician, Location, 
-    TimeWindow, Priority, SkillType, OptimizationConfig
+    Location,
+    RouteResult,
+    Stop as OptStop,
+    Vehicle as OptVehicle,
+    optimize_routes,
 )
 
-# Initialize Flask app
+# ── App setup ────────────────────────────────────────────────────────────────
+
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key')
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
-    'DATABASE_URL', 
-    'sqlite:///gbg_field_service.db'
-)
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-key")
+app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///gbg_routes.db"
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-# Initialize extensions
 db = SQLAlchemy(app)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-# Initialize optimizer
-optimizer = RouteOptimizer()
+# ── Models ───────────────────────────────────────────────────────────────────
 
 
-# Database Models
-class ServiceCallModel(db.Model):
-    __tablename__ = 'service_calls'
-    
-    id = db.Column(db.String(50), primary_key=True)
-    customer_name = db.Column(db.String(100), nullable=False)
-    address = db.Column(db.String(200), nullable=False)
+class Depot(db.Model):
+    __tablename__ = "depot"
+    id = db.Column(db.Integer, primary_key=True)
+    address = db.Column(db.String(300), nullable=False)
     latitude = db.Column(db.Float, nullable=False)
     longitude = db.Column(db.Float, nullable=False)
-    scheduled_date = db.Column(db.Date, nullable=False)
-    time_window_start = db.Column(db.Time, nullable=False)
-    time_window_end = db.Column(db.Time, nullable=False)
-    duration_minutes = db.Column(db.Integer, default=60)
-    priority = db.Column(db.String(20), default='MEDIUM')
-    required_skills = db.Column(db.String(200))  # JSON string
-    status = db.Column(db.String(20), default='pending')
-    assigned_technician_id = db.Column(db.String(50))
-    notes = db.Column(db.Text)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = db.Column(
+        db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+    def to_dict(self):
+        return {
+            "address": self.address,
+            "lat": self.latitude,
+            "lng": self.longitude,
+        }
 
 
-class TechnicianModel(db.Model):
-    __tablename__ = 'technicians'
-    
+class Vehicle(db.Model):
+    __tablename__ = "vehicles"
     id = db.Column(db.String(50), primary_key=True)
     name = db.Column(db.String(100), nullable=False)
-    email = db.Column(db.String(100), unique=True)
-    phone = db.Column(db.String(20))
-    skills = db.Column(db.String(200))  # JSON string
-    home_address = db.Column(db.String(200))
-    home_latitude = db.Column(db.Float)
-    home_longitude = db.Column(db.Float)
-    work_start_time = db.Column(db.Time, default=datetime.strptime('08:00', '%H:%M').time())
-    work_end_time = db.Column(db.Time, default=datetime.strptime('17:00', '%H:%M').time())
-    max_calls_per_day = db.Column(db.Integer, default=8)
+    license_plate = db.Column(db.String(20))
+    capacity = db.Column(db.Integer, default=50)
+    mpg = db.Column(db.Float, default=20.0)
+    total_miles = db.Column(db.Float, default=0.0)  # lifetime odometer
+    notes = db.Column(db.Text)
     active = db.Column(db.Boolean, default=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "name": self.name,
+            "licensePlate": self.license_plate,
+            "capacity": self.capacity,
+            "mpg": self.mpg,
+            "totalMiles": round(self.total_miles or 0.0, 2),
+            "notes": self.notes or "",
+        }
 
-# API Routes
-@app.route('/api/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'healthy',
-        'timestamp': datetime.utcnow().isoformat()
-    })
+
+class DeliveryStop(db.Model):
+    __tablename__ = "delivery_stops"
+    id = db.Column(db.String(50), primary_key=True)
+    recipient_name = db.Column(db.String(100), nullable=False)
+    address = db.Column(db.String(300), nullable=False)
+    latitude = db.Column(db.Float, nullable=False)
+    longitude = db.Column(db.Float, nullable=False)
+    notes = db.Column(db.Text)
+    active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "recipientName": self.recipient_name,
+            "address": self.address,
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "notes": self.notes or "",
+        }
 
 
-@app.route('/api/dashboard/stats', methods=['GET'])
-def get_dashboard_stats():
-    """Get dashboard statistics"""
+class OptimizationRun(db.Model):
+    __tablename__ = "optimization_runs"
+    id = db.Column(db.String(50), primary_key=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    routes_json = db.Column(db.Text)
+    total_fleet_miles = db.Column(db.Float)
+    num_vehicles = db.Column(db.Integer)
+    num_stops = db.Column(db.Integer)
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _new_id(prefix: str) -> str:
+    return f"{prefix}{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
+
+
+# ── Routes: Geocoding ─────────────────────────────────────────────────────────
+
+
+@app.route("/api/geocode", methods=["POST"])
+def geocode():
+    address = (request.json or {}).get("address", "").strip()
+    if not address:
+        return jsonify({"error": "Address is required"}), 400
     try:
-        today = datetime.utcnow().date()
-        
-        total_calls = ServiceCallModel.query.count()
-        completed_today = ServiceCallModel.query.filter_by(
-            scheduled_date=today,
-            status='completed'
-        ).count()
-        scheduled_today = ServiceCallModel.query.filter_by(
-            scheduled_date=today
-        ).count()
-        active_technicians = TechnicianModel.query.filter_by(active=True).count()
-        
-        return jsonify({
-            'totalCalls': total_calls,
-            'completedCalls': completed_today,
-            'scheduledToday': scheduled_today,
-            'activeTechnicians': active_technicians
-        })
-    except Exception as e:
-        logger.error(f"Error getting dashboard stats: {e}")
-        return jsonify({'error': 'Failed to fetch statistics'}), 500
-
-
-@app.route('/api/service-calls', methods=['GET'])
-def get_service_calls():
-    """Get all service calls"""
-    try:
-        calls = ServiceCallModel.query.all()
-        return jsonify([{
-            'id': call.id,
-            'customerName': call.customer_name,
-            'address': call.address,
-            'scheduledDate': call.scheduled_date.isoformat(),
-            'timeWindow': f"{call.time_window_start.strftime('%H:%M')} - {call.time_window_end.strftime('%H:%M')}",
-            'priority': call.priority,
-            'status': call.status,
-            'assignedTechnician': call.assigned_technician_id
-        } for call in calls])
-    except Exception as e:
-        logger.error(f"Error fetching service calls: {e}")
-        return jsonify({'error': 'Failed to fetch service calls'}), 500
-
-
-@app.route('/api/service-calls', methods=['POST'])
-def create_service_call():
-    """Create a new service call"""
-    try:
-        data = request.json
-        
-        # Generate ID if not provided
-        if 'id' not in data:
-            data['id'] = f"SC{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
-        
-        call = ServiceCallModel(
-            id=data['id'],
-            customer_name=data['customerName'],
-            address=data['address'],
-            latitude=data['latitude'],
-            longitude=data['longitude'],
-            scheduled_date=datetime.fromisoformat(data['scheduledDate']).date(),
-            time_window_start=datetime.strptime(data['timeWindowStart'], '%H:%M').time(),
-            time_window_end=datetime.strptime(data['timeWindowEnd'], '%H:%M').time(),
-            duration_minutes=data.get('durationMinutes', 60),
-            priority=data.get('priority', 'MEDIUM'),
-            required_skills=','.join(data.get('requiredSkills', [])),
-            notes=data.get('notes', '')
+        resp = http_requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": address, "format": "json", "limit": 1},
+            headers={"User-Agent": "GBG-Route-Optimizer/1.0"},
+            timeout=10,
         )
-        
-        db.session.add(call)
-        db.session.commit()
-        
-        return jsonify({
-            'id': call.id,
-            'message': 'Service call created successfully'
-        }), 201
-        
-    except Exception as e:
-        logger.error(f"Error creating service call: {e}")
-        db.session.rollback()
-        return jsonify({'error': 'Failed to create service call'}), 500
-
-
-@app.route('/api/technicians', methods=['GET'])
-def get_technicians():
-    """Get all technicians"""
-    try:
-        technicians = TechnicianModel.query.filter_by(active=True).all()
-        return jsonify([{
-            'id': tech.id,
-            'name': tech.name,
-            'email': tech.email,
-            'phone': tech.phone,
-            'skills': tech.skills.split(',') if tech.skills else [],
-            'workHours': f"{tech.work_start_time.strftime('%H:%M')} - {tech.work_end_time.strftime('%H:%M')}",
-            'maxCallsPerDay': tech.max_calls_per_day
-        } for tech in technicians])
-    except Exception as e:
-        logger.error(f"Error fetching technicians: {e}")
-        return jsonify({'error': 'Failed to fetch technicians'}), 500
-
-
-@app.route('/api/technicians', methods=['POST'])
-def create_technician():
-    """Create a new technician"""
-    try:
-        data = request.json
-        
-        # Generate ID if not provided
-        if 'id' not in data:
-            data['id'] = f"T{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
-        
-        tech = TechnicianModel(
-            id=data['id'],
-            name=data['name'],
-            email=data.get('email'),
-            phone=data.get('phone'),
-            skills=','.join(data.get('skills', [])),
-            home_address=data.get('homeAddress'),
-            home_latitude=data.get('homeLatitude'),
-            home_longitude=data.get('homeLongitude'),
-            work_start_time=datetime.strptime(data.get('workStartTime', '08:00'), '%H:%M').time(),
-            work_end_time=datetime.strptime(data.get('workEndTime', '17:00'), '%H:%M').time(),
-            max_calls_per_day=data.get('maxCallsPerDay', 8)
+        data = resp.json()
+        if not data:
+            return jsonify({"error": "Address not found"}), 404
+        return jsonify(
+            {
+                "lat": float(data[0]["lat"]),
+                "lng": float(data[0]["lon"]),
+                "displayName": data[0]["display_name"],
+            }
         )
-        
-        db.session.add(tech)
-        db.session.commit()
-        
-        return jsonify({
-            'id': tech.id,
-            'message': 'Technician created successfully'
-        }), 201
-        
     except Exception as e:
-        logger.error(f"Error creating technician: {e}")
-        db.session.rollback()
-        return jsonify({'error': 'Failed to create technician'}), 500
+        return jsonify({"error": f"Geocoding unavailable: {str(e)}"}), 503
 
 
-@app.route('/api/optimize', methods=['POST'])
-def optimize_routes():
-    """Optimize routes for a given date"""
-    try:
-        data = request.json
-        target_date = datetime.fromisoformat(data['date']).date() if 'date' in data else datetime.utcnow().date()
-        
-        # Fetch service calls for the date
-        db_calls = ServiceCallModel.query.filter_by(
-            scheduled_date=target_date,
-            status='pending'
+# ── Routes: Depot ─────────────────────────────────────────────────────────────
+
+
+@app.route("/api/depot", methods=["GET"])
+def get_depot():
+    depot = Depot.query.first()
+    return jsonify(depot.to_dict() if depot else None)
+
+
+@app.route("/api/depot", methods=["POST"])
+def set_depot():
+    data = request.json or {}
+    depot = Depot.query.first()
+    if depot:
+        depot.address = data["address"]
+        depot.latitude = data["lat"]
+        depot.longitude = data["lng"]
+    else:
+        depot = Depot(
+            address=data["address"],
+            latitude=data["lat"],
+            longitude=data["lng"],
+        )
+        db.session.add(depot)
+    db.session.commit()
+    return jsonify(depot.to_dict())
+
+
+# ── Routes: Vehicles ──────────────────────────────────────────────────────────
+
+
+@app.route("/api/vehicles", methods=["GET"])
+def get_vehicles():
+    vehicles = Vehicle.query.filter_by(active=True).order_by(Vehicle.created_at).all()
+    return jsonify([v.to_dict() for v in vehicles])
+
+
+@app.route("/api/vehicles", methods=["POST"])
+def create_vehicle():
+    data = request.json or {}
+    v = Vehicle(
+        id=_new_id("V"),
+        name=data["name"],
+        license_plate=data.get("licensePlate"),
+        capacity=int(data.get("capacity", 50)),
+        mpg=float(data.get("mpg", 20.0)),
+        total_miles=float(data.get("totalMiles", 0.0)),
+        notes=data.get("notes"),
+    )
+    db.session.add(v)
+    db.session.commit()
+    return jsonify(v.to_dict()), 201
+
+
+@app.route("/api/vehicles/<vid>", methods=["PUT"])
+def update_vehicle(vid):
+    v = db.session.get(Vehicle, vid)
+    if not v:
+        return jsonify({"error": "Not found"}), 404
+    data = request.json or {}
+    mapping = {
+        "name": "name",
+        "licensePlate": "license_plate",
+        "capacity": "capacity",
+        "mpg": "mpg",
+        "totalMiles": "total_miles",
+        "notes": "notes",
+    }
+    for key, col in mapping.items():
+        if key in data:
+            setattr(v, col, data[key])
+    db.session.commit()
+    return jsonify(v.to_dict())
+
+
+@app.route("/api/vehicles/<vid>", methods=["DELETE"])
+def delete_vehicle(vid):
+    v = db.session.get(Vehicle, vid)
+    if not v:
+        return jsonify({"error": "Not found"}), 404
+    v.active = False
+    db.session.commit()
+    return jsonify({"message": "Vehicle removed"})
+
+
+# ── Routes: Delivery Stops ────────────────────────────────────────────────────
+
+
+@app.route("/api/stops", methods=["GET"])
+def get_stops():
+    stops = (
+        DeliveryStop.query.filter_by(active=True)
+        .order_by(DeliveryStop.created_at)
+        .all()
+    )
+    return jsonify([s.to_dict() for s in stops])
+
+
+@app.route("/api/stops", methods=["POST"])
+def create_stop():
+    data = request.json or {}
+    s = DeliveryStop(
+        id=_new_id("S"),
+        recipient_name=data["recipientName"],
+        address=data["address"],
+        latitude=float(data["latitude"]),
+        longitude=float(data["longitude"]),
+        notes=data.get("notes"),
+    )
+    db.session.add(s)
+    db.session.commit()
+    return jsonify(s.to_dict()), 201
+
+
+@app.route("/api/stops/<sid>", methods=["DELETE"])
+def delete_stop(sid):
+    s = db.session.get(DeliveryStop, sid)
+    if not s:
+        return jsonify({"error": "Not found"}), 404
+    s.active = False
+    db.session.commit()
+    return jsonify({"message": "Stop removed"})
+
+
+# ── Routes: Optimization ──────────────────────────────────────────────────────
+
+
+@app.route("/api/optimize", methods=["POST"])
+def run_optimization():
+    data = request.json or {}
+
+    depot = Depot.query.first()
+    if not depot:
+        return jsonify({"error": "No depot set. Configure a depot location first."}), 400
+
+    vehicle_ids = data.get("vehicleIds")
+    stop_ids = data.get("stopIds")
+
+    if vehicle_ids:
+        db_vehicles = Vehicle.query.filter(
+            Vehicle.id.in_(vehicle_ids), Vehicle.active == True
         ).all()
-        
-        # Fetch active technicians
-        db_technicians = TechnicianModel.query.filter_by(active=True).all()
-        
-        if not db_calls:
-            return jsonify({
-                'routes': [],
-                'unassigned': [],
-                'warnings': ['No pending service calls for the selected date']
-            })
-        
-        # Convert to optimization objects
-        service_calls = []
-        for call in db_calls:
-            # Combine date and time for datetime objects
-            start_datetime = datetime.combine(call.scheduled_date, call.time_window_start)
-            end_datetime = datetime.combine(call.scheduled_date, call.time_window_end)
-            
-            service_calls.append(ServiceCall(
-                id=call.id,
-                customer_name=call.customer_name,
-                location=Location(call.address, call.latitude, call.longitude),
-                time_window=TimeWindow(start_datetime, end_datetime),
-                duration_minutes=call.duration_minutes,
-                priority=Priority[call.priority],
-                required_skills=[SkillType(s) for s in call.required_skills.split(',') if s]
-            ))
-        
-        technicians = []
-        for tech in db_technicians:
-            # Combine date and time for datetime objects
-            start_datetime = datetime.combine(target_date, tech.work_start_time)
-            end_datetime = datetime.combine(target_date, tech.work_end_time)
-            
-            technicians.append(Technician(
-                id=tech.id,
-                name=tech.name,
-                skills=[SkillType(s) for s in tech.skills.split(',') if s],
-                home_location=Location(
-                    tech.home_address or "Office",
-                    tech.home_latitude or 40.7580,
-                    tech.home_longitude or -73.9855
-                ),
-                work_hours=TimeWindow(start_datetime, end_datetime),
-                max_calls_per_day=tech.max_calls_per_day
-            ))
-        
-        # Run optimization
-        result = optimizer.optimize(service_calls, technicians)
-        
-        # Format response
-        formatted_routes = []
-        for route in result['routes']:
-            formatted_routes.append({
-                'technician': {
-                    'id': route['technician'].id,
-                    'name': route['technician'].name
-                },
-                'calls': [{
-                    'id': stop['call'].id,
-                    'customerName': stop['call'].customer_name,
-                    'address': stop['call'].location.address,
-                    'arrivalTime': stop['arrival_time'],
-                    'departureTime': stop['departure_time']
-                } for stop in route['calls']],
-                'totalDistance': round(route['total_distance'], 2),
-                'utilization': round(route['utilization'] * 100, 1)
-            })
-        
-        formatted_unassigned = [{
-            'id': call.id,
-            'customerName': call.customer_name,
-            'address': call.location.address,
-            'reason': 'No available technician with required skills'
-        } for call in result['unassigned']]
-        
-        return jsonify({
-            'routes': formatted_routes,
-            'unassigned': formatted_unassigned,
-            'statistics': result['statistics'],
-            'warnings': result['warnings']
-        })
-        
-    except Exception as e:
-        logger.error(f"Error optimizing routes: {e}")
-        return jsonify({'error': f'Failed to optimize routes: {str(e)}'}), 500
+    else:
+        db_vehicles = Vehicle.query.filter_by(active=True).all()
+
+    if stop_ids:
+        db_stops = DeliveryStop.query.filter(
+            DeliveryStop.id.in_(stop_ids), DeliveryStop.active == True
+        ).all()
+    else:
+        db_stops = DeliveryStop.query.filter_by(active=True).all()
+
+    if not db_vehicles:
+        return jsonify({"error": "No active vehicles found"}), 400
+    if not db_stops:
+        return jsonify({"error": "No delivery stops found"}), 400
+
+    depot_loc = Location(lat=depot.latitude, lng=depot.longitude)
+    opt_vehicles = [
+        OptVehicle(id=v.id, name=v.name, capacity=v.capacity) for v in db_vehicles
+    ]
+    opt_stops = [
+        OptStop(id=s.id, location=Location(lat=s.latitude, lng=s.longitude))
+        for s in db_stops
+    ]
+
+    results: list[RouteResult] = optimize_routes(
+        depot_loc, opt_stops, opt_vehicles, max_search_seconds=30
+    )
+
+    if not results:
+        return jsonify({"error": "Optimizer could not find a solution"}), 422
+
+    stop_map = {s.id: s for s in db_stops}
+    vehicle_map = {v.id: v for v in db_vehicles}
+
+    routes = []
+    total_fleet_miles = 0.0
+
+    for r in results:
+        v = vehicle_map[r.vehicle_id]
+        stops_detail = [
+            {
+                "id": stop_map[sid].id,
+                "sequence": i + 1,
+                "recipientName": stop_map[sid].recipient_name,
+                "address": stop_map[sid].address,
+                "latitude": stop_map[sid].latitude,
+                "longitude": stop_map[sid].longitude,
+            }
+            for i, sid in enumerate(r.stop_ids)
+            if sid in stop_map
+        ]
+        fuel_gallons = (
+            round(r.total_distance_miles / v.mpg, 2) if v.mpg else None
+        )
+        total_fleet_miles += r.total_distance_miles
+        routes.append(
+            {
+                "vehicleId": r.vehicle_id,
+                "vehicleName": v.name,
+                "licensePlate": v.license_plate,
+                "mpg": v.mpg,
+                "stops": stops_detail,
+                "totalDistanceMiles": r.total_distance_miles,
+                "totalDistanceKm": r.total_distance_km,
+                "estimatedMinutes": r.estimated_minutes,
+                "estimatedHours": round(r.estimated_minutes / 60, 2),
+                "fuelGallons": fuel_gallons,
+            }
+        )
+
+    return jsonify(
+        {
+            "routes": routes,
+            "depot": depot.to_dict(),
+            "totalFleetMiles": round(total_fleet_miles, 2),
+            "numVehicles": len(results),
+            "numStops": len(db_stops),
+        }
+    )
 
 
-@app.route('/api/save-schedule', methods=['POST'])
-def save_schedule():
-    """Save the optimized schedule"""
-    try:
-        data = request.json
-        routes = data.get('routes', [])
-        
-        # Update service calls with assignments
-        for route in routes:
-            technician_id = route['technician']['id']
-            for call in route['calls']:
-                db_call = ServiceCallModel.query.get(call['id'])
-                if db_call:
-                    db_call.assigned_technician_id = technician_id
-                    db_call.status = 'scheduled'
-        
-        db.session.commit()
-        
-        return jsonify({'message': 'Schedule saved successfully'}), 200
-        
-    except Exception as e:
-        logger.error(f"Error saving schedule: {e}")
-        db.session.rollback()
-        return jsonify({'error': 'Failed to save schedule'}), 500
+@app.route("/api/optimize/save", methods=["POST"])
+def save_optimization():
+    """Persist a route plan and increment each vehicle's odometer."""
+    data = request.json or {}
+    routes = data.get("routes", [])
+
+    run = OptimizationRun(
+        id=_new_id("R"),
+        routes_json=json.dumps(routes),
+        total_fleet_miles=sum(r.get("totalDistanceMiles", 0) for r in routes),
+        num_vehicles=len(routes),
+        num_stops=sum(len(r.get("stops", [])) for r in routes),
+    )
+    db.session.add(run)
+
+    for r in routes:
+        v = db.session.get(Vehicle, r["vehicleId"])
+        if v:
+            v.total_miles = (v.total_miles or 0.0) + r.get("totalDistanceMiles", 0.0)
+
+    db.session.commit()
+    return jsonify({"runId": run.id, "message": "Saved and odometers updated"})
 
 
-# Initialize database
-@app.before_request
-def create_tables():
+# ── Routes: Stats ─────────────────────────────────────────────────────────────
+
+
+@app.route("/api/stats", methods=["GET"])
+def get_stats():
+    vehicles = Vehicle.query.filter_by(active=True).all()
+    num_stops = DeliveryStop.query.filter_by(active=True).count()
+    num_runs = OptimizationRun.query.count()
+    total_fleet_miles = sum(v.total_miles or 0 for v in vehicles)
+    return jsonify(
+        {
+            "numVehicles": len(vehicles),
+            "numStops": num_stops,
+            "numRuns": num_runs,
+            "totalFleetMiles": round(total_fleet_miles, 2),
+            "vehicles": [v.to_dict() for v in vehicles],
+        }
+    )
+
+
+# ── Routes: Health ────────────────────────────────────────────────────────────
+
+
+@app.route("/api/health", methods=["GET"])
+def health():
+    return jsonify({"status": "healthy", "timestamp": datetime.utcnow().isoformat()})
+
+
+# ── Init ──────────────────────────────────────────────────────────────────────
+
+
+with app.app_context():
     db.create_all()
-    logger.info("Database tables created")
 
 
-# Error handlers
 @app.errorhandler(404)
-def not_found(error):
-    return jsonify({'error': 'Not found'}), 404
+def not_found(e):
+    return jsonify({"error": "Not found"}), 404
 
 
 @app.errorhandler(500)
-def internal_error(error):
-    return jsonify({'error': 'Internal server error'}), 500
+def server_error(e):
+    return jsonify({"error": "Internal server error"}), 500
 
 
-if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5001)
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=5001)
