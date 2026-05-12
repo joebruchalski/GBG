@@ -1,6 +1,7 @@
 import { useState } from 'react'
-import { MapPin, Plus, Trash2, Search, Loader2, AlertCircle, X } from 'lucide-react'
+import { MapPin, Plus, Trash2, Search, Loader2, AlertCircle, X, Upload, CheckSquare } from 'lucide-react'
 import { geocode, createStop, deleteStop, getStops } from '../api'
+import BulkUploadModal from './BulkUploadModal'
 
 const DEFAULT_FORM = { recipientName: '', address: '', notes: '' }
 
@@ -10,6 +11,9 @@ export default function Stops({ stops, onStopsChange, depot }) {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState(null)
   const [resolvedAddress, setResolvedAddress] = useState(null) // geocoded result
+  const [showBulkModal, setShowBulkModal] = useState(false)
+  const [selected, setSelected] = useState(new Set()) // IDs of checked stops
+  const [deleting, setDeleting] = useState(false)
 
   async function refresh() {
     const s = await getStops()
@@ -58,9 +62,41 @@ export default function Stops({ stops, onStopsChange, depot }) {
     if (!confirm('Remove this delivery stop?')) return
     try {
       await deleteStop(id)
+      setSelected(s => { const n = new Set(s); n.delete(id); return n })
       await refresh()
     } catch (err) {
       setError(err.message)
+    }
+  }
+
+  async function handleDeleteSelected() {
+    if (selected.size === 0) return
+    if (!confirm(`Remove ${selected.size} selected stop${selected.size > 1 ? 's' : ''}?`)) return
+    setDeleting(true)
+    try {
+      await Promise.all([...selected].map(id => deleteStop(id)))
+      setSelected(new Set())
+      await refresh()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  function toggleSelect(id) {
+    setSelected(s => {
+      const n = new Set(s)
+      n.has(id) ? n.delete(id) : n.add(id)
+      return n
+    })
+  }
+
+  function toggleSelectAll() {
+    if (selected.size === stops.length) {
+      setSelected(new Set())
+    } else {
+      setSelected(new Set(stops.map(s => s.id)))
     }
   }
 
@@ -69,11 +105,34 @@ export default function Stops({ stops, onStopsChange, depot }) {
       <div className="max-w-3xl mx-auto">
 
         {/* Header */}
-        <div className="mb-6">
-          <h1 className="text-xl font-bold text-gray-900">Delivery Stops</h1>
-          <p className="text-sm text-gray-500 mt-0.5">
-            {stops.length} stop{stops.length !== 1 ? 's' : ''} configured
-          </p>
+        <div className="mb-6 flex items-start justify-between gap-3 flex-wrap">
+          <div>
+            <h1 className="text-xl font-bold text-gray-900">Delivery Stops</h1>
+            <p className="text-sm text-gray-500 mt-0.5">
+              {stops.length} stop{stops.length !== 1 ? 's' : ''} configured
+              {selected.size > 0 && (
+                <span className="ml-2 text-indigo-600 font-medium">· {selected.size} selected</span>
+              )}
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            {selected.size > 0 && (
+              <button
+                onClick={handleDeleteSelected}
+                disabled={deleting}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-white bg-red-500 rounded-lg hover:bg-red-600 disabled:opacity-50 transition-colors"
+              >
+                {deleting ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}
+                Delete {selected.size}
+              </button>
+            )}
+            <button
+              onClick={() => setShowBulkModal(true)}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-gray-600 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors"
+            >
+              <Upload size={14} /> Bulk Import
+            </button>
+          </div>
         </div>
 
         {/* Add Stop form */}
@@ -190,11 +249,29 @@ export default function Stops({ stops, onStopsChange, depot }) {
           </div>
         ) : (
           <div className="space-y-2">
+            {/* Select all row */}
+            <div className="flex items-center gap-3 px-1 pb-1">
+              <input
+                type="checkbox"
+                checked={selected.size === stops.length && stops.length > 0}
+                onChange={toggleSelectAll}
+                className="rounded border-gray-300 text-indigo-600 focus:ring-indigo-400"
+              />
+              <span className="text-xs text-gray-500 select-none">Select all</span>
+            </div>
             {stops.map((stop, idx) => (
               <div
                 key={stop.id}
-                className="bg-white border border-gray-200 rounded-xl px-4 py-3 flex items-start gap-3 shadow-sm hover:shadow-md transition-shadow"
+                className={`bg-white border rounded-xl px-4 py-3 flex items-start gap-3 shadow-sm transition-all ${
+                  selected.has(stop.id) ? 'border-indigo-300 bg-indigo-50' : 'border-gray-200 hover:shadow-md'
+                }`}
               >
+                <input
+                  type="checkbox"
+                  checked={selected.has(stop.id)}
+                  onChange={() => toggleSelect(stop.id)}
+                  className="mt-1 rounded border-gray-300 text-indigo-600 focus:ring-indigo-400 shrink-0"
+                />
                 <div className="bg-indigo-100 rounded-full w-8 h-8 flex items-center justify-center text-indigo-700 font-bold text-sm shrink-0 mt-0.5">
                   {idx + 1}
                 </div>
@@ -216,6 +293,13 @@ export default function Stops({ stops, onStopsChange, depot }) {
           </div>
         )}
       </div>
+
+      {showBulkModal && (
+        <BulkUploadModal
+          onClose={() => setShowBulkModal(false)}
+          onSuccess={(newStops) => { onStopsChange([...stops, ...newStops]) }}
+        />
+      )}
     </div>
   )
 }

@@ -1,9 +1,11 @@
-import { Truck, Map, MapPin, LogOut } from 'lucide-react'
+import { Truck, Map, MapPin, BarChart2, LogOut, CalendarDays } from 'lucide-react'
 
 const tabs = [
   { id: 'map', label: 'Routes', icon: Map },
   { id: 'fleet', label: 'Fleet', icon: Truck },
   { id: 'stops', label: 'Stops', icon: MapPin },
+  { id: 'analytics', label: 'Analytics', icon: BarChart2 },
+  { id: 'planning', label: 'Planning', icon: CalendarDays },
 ]
 
 export default function Navbar({ tab, setTab, user, onLogout }) {
@@ -33,10 +35,8 @@ export default function Navbar({ tab, setTab, user, onLogout }) {
         </button>
       ))}
 
-      {/* Spacer */}
       <div className="flex-1" />
 
-      {/* User + logout */}
       {user && (
         <div className="flex items-center gap-3">
           <span className="text-sm text-gray-600 hidden sm:block">

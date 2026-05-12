@@ -90,8 +90,10 @@ export default function MapView({
   setDepot,
   vehicles,
   stops,
+  drivers,
   optimizationResult,
   setOptimizationResult,
+  onVehiclesChange,
 }) {
   const [depotInput, setDepotInput] = useState('')
   const [settingDepot, setSettingDepot] = useState(false)
@@ -99,6 +101,8 @@ export default function MapView({
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState(null)
+  const [showSaveModal, setShowSaveModal] = useState(false)
+  const [saveForm, setSaveForm] = useState({ runDate: '', notes: '', driverAssignments: {} })
 
   // Map from stop id → { color, sequence } after optimization
   const stopMeta = useMemo(() => {
@@ -150,13 +154,35 @@ export default function MapView({
     }
   }
 
-  async function handleSave() {
+  function openSaveModal() {
     if (!optimizationResult) return
+    const today = new Date().toISOString().split('T')[0]
+    const assignments = {}
+    optimizationResult.routes.forEach((route) => {
+      const v = vehicles.find((vv) => vv.id === route.vehicleId)
+      if (v?.defaultDriverId) assignments[route.vehicleId] = v.defaultDriverId
+    })
+    setSaveForm({ runDate: today, notes: '', driverAssignments: assignments })
+    setShowSaveModal(true)
+  }
+
+  async function handleSave() {
     setSaving(true)
     setError(null)
     try {
-      await saveOptimization(optimizationResult.routes)
+      await saveOptimization(optimizationResult.routes, {
+        runDate: saveForm.runDate,
+        notes: saveForm.notes,
+        driverAssignments: saveForm.driverAssignments,
+      })
+      // Refresh vehicles so odometers + oil change counters update
+      if (onVehiclesChange) {
+        const { getVehicles } = await import('../api')
+        const updated = await getVehicles()
+        onVehiclesChange(updated)
+      }
       setSaved(true)
+      setShowSaveModal(false)
     } catch (err) {
       setError(err.message)
     } finally {
@@ -251,7 +277,7 @@ export default function MapView({
                 Route Results
               </h3>
               <button
-                onClick={handleSave}
+                onClick={openSaveModal}
                 disabled={saving || saved}
                 className={`flex items-center gap-1.5 text-xs px-3 py-1 rounded-md font-medium transition-colors ${
                   saved
@@ -334,6 +360,97 @@ export default function MapView({
           </div>
         )}
       </div>
+
+      {/* Save Modal */}
+      {showSaveModal && optimizationResult && (
+        <div className="fixed inset-0 z-[1000] flex items-center justify-center bg-black/40">
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-md mx-4 p-6">
+            <h2 className="font-bold text-gray-900 text-lg mb-4">Save Route Run</h2>
+
+            <div className="space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-1">Run Date</label>
+                <input
+                  type="date"
+                  value={saveForm.runDate}
+                  onChange={(e) => setSaveForm({ ...saveForm, runDate: e.target.value })}
+                  className="w-full border border-gray-200 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-2">Driver Assignments</label>
+                <div className="space-y-2">
+                  {optimizationResult.routes.filter((r) => r.stops.length > 0).map((route) => {
+                    return (
+                      <div key={route.vehicleId} className="flex items-center gap-3">
+                        <span className="text-sm text-gray-700 w-32 shrink-0 truncate">{route.vehicleName}</span>
+                        <select
+                          value={saveForm.driverAssignments[route.vehicleId] || ''}
+                          onChange={(e) => {
+                            const newAssignments = { ...saveForm.driverAssignments, [route.vehicleId]: e.target.value || undefined }
+                            if (!e.target.value) delete newAssignments[route.vehicleId]
+                            setSaveForm({ ...saveForm, driverAssignments: newAssignments })
+                          }}
+                          className="flex-1 border border-gray-200 rounded-md px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
+                        >
+                          <option value="">— No driver —</option>
+                          {(drivers || []).map((d) => (
+                            <option key={d.id} value={d.id}>{d.name}</option>
+                          ))}
+                        </select>
+                        {saveForm.driverAssignments[route.vehicleId] && (
+                          <button
+                            title="Set as default driver for this vehicle"
+                            onClick={async () => {
+                              const { setDefaultDriver, getVehicles } = await import('../api')
+                              await setDefaultDriver(route.vehicleId, saveForm.driverAssignments[route.vehicleId])
+                              if (onVehiclesChange) {
+                                const updated = await getVehicles()
+                                onVehiclesChange(updated)
+                              }
+                            }}
+                            className="text-xs px-2 py-1 bg-indigo-50 text-indigo-600 rounded-md hover:bg-indigo-100 whitespace-nowrap"
+                          >
+                            Always assign
+                          </button>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-1">Notes (optional)</label>
+                <input
+                  type="text"
+                  value={saveForm.notes}
+                  onChange={(e) => setSaveForm({ ...saveForm, notes: e.target.value })}
+                  placeholder="e.g. Monday meal deliveries"
+                  className="w-full border border-gray-200 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
+                />
+              </div>
+            </div>
+
+            <div className="flex gap-3 justify-end mt-6">
+              <button
+                onClick={() => setShowSaveModal(false)}
+                className="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded-lg"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleSave}
+                disabled={saving}
+                className="flex items-center gap-2 px-4 py-2 text-sm bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50"
+              >
+                {saving ? 'Saving…' : 'Save & Update Odometers'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── MAP ── */}
       <div className="flex-1">

@@ -68,8 +68,50 @@ export const optimize = (vehicleIds, stopIds) =>
     }),
   })
 
-export const saveOptimization = (routes) =>
-  req('/optimize/save', { method: 'POST', body: JSON.stringify({ routes }) })
+export const saveOptimization = (routes, { runDate, driverAssignments, notes } = {}) =>
+  req('/optimize/save', {
+    method: 'POST',
+    body: JSON.stringify({ routes, runDate, driverAssignments, notes }),
+  })
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
 export const getStats = () => req('/stats')
+export const getAnalytics = (period) =>
+  req(`/analytics${period ? '?period=' + period : ''}`)
+export const getPlan = (id) => req(`/schedule/${id}`)
+
+// ── Drivers ───────────────────────────────────────────────────────────────────
+export const getDrivers = () => req('/drivers')
+export const createDriver = (data) =>
+  req('/drivers', { method: 'POST', body: JSON.stringify(data) })
+export const updateDriver = (id, data) =>
+  req(`/drivers/${id}`, { method: 'PUT', body: JSON.stringify(data) })
+export const deleteDriver = (id) => req(`/drivers/${id}`, { method: 'DELETE' })
+export const setDefaultDriver = (vehicleId, driverId) =>
+  req(`/vehicles/${vehicleId}/default-driver`, { method: 'PUT', body: JSON.stringify({ driverId }) })
+export const logOilChange = (vehicleId) =>
+  req(`/vehicles/${vehicleId}/oil-change`, { method: 'POST' })
+
+// ── History ───────────────────────────────────────────────────────────────────
+export const getHistory = (params = {}) => {
+  const qs = new URLSearchParams(params).toString()
+  return req(`/history${qs ? '?' + qs : ''}`)
+}
+
+// ── Schedule ──────────────────────────────────────────────────────────────────
+export const getCalendar = (year, month) =>
+  req(`/schedule/calendar?year=${year}&month=${month}`)
+export const getPlans = (status) =>
+  req(`/schedule/plans${status ? '?status=' + status : ''}`)
+export const createScheduledRoute = (data) =>
+  req('/schedule', { method: 'POST', body: JSON.stringify(data) })
+export const updateScheduledRoute = (id, data) =>
+  req(`/schedule/${id}`, { method: 'PUT', body: JSON.stringify(data) })
+export const deleteScheduledRoute = (id) =>
+  req(`/schedule/${id}`, { method: 'DELETE' })
+
+// ── Bulk Stops ────────────────────────────────────────────────────────────────
+export const bulkGeocode = (rows) =>
+  req('/stops/bulk-geocode', { method: 'POST', body: JSON.stringify({ rows }) })
+export const bulkCreateStops = (rows) =>
+  req('/stops/bulk', { method: 'POST', body: JSON.stringify({ rows }) })

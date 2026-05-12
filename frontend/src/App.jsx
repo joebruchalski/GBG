@@ -1,15 +1,15 @@
 import { useEffect, useState } from 'react'
 import Navbar from './components/Navbar'
 import MapView from './components/MapView'
-import Fleet from './components/Fleet'
+import FleetView from './components/FleetView'
 import Stops from './components/Stops'
+import AnalyticsView from './components/AnalyticsView'
+import PlanningView from './components/PlanningView'
 import LoginPage from './components/LoginPage'
 import LandingPage from './components/LandingPage'
 import AboutPage from './components/AboutPage'
 import PricingPage from './components/PricingPage'
-import { getToken, clearToken, getMe, getDepot, getVehicles, getStops } from './api'
-
-// view: 'loading' | 'landing' | 'about' | 'pricing' | 'login' | 'app'
+import { getToken, clearToken, getMe, getDepot, getVehicles, getStops, getDrivers } from './api'
 
 export default function App() {
   const [view, setView] = useState('loading')
@@ -19,16 +19,13 @@ export default function App() {
   const [depot, setDepot] = useState(null)
   const [vehicles, setVehicles] = useState([])
   const [stops, setStops] = useState([])
+  const [drivers, setDrivers] = useState([])
   const [optimizationResult, setOptimizationResult] = useState(null)
 
-  // On mount: check for a valid stored token
   useEffect(() => {
     async function checkAuth() {
       const token = getToken()
-      if (!token) {
-        setView('landing')
-        return
-      }
+      if (!token) { setView('landing'); return }
       try {
         const me = await getMe()
         setUser(me)
@@ -41,7 +38,6 @@ export default function App() {
     checkAuth()
   }, [])
 
-  // Listen for token expiry mid-session → drop back to landing
   useEffect(() => {
     function handleUnauthorized() {
       setUser(null)
@@ -51,17 +47,17 @@ export default function App() {
     return () => window.removeEventListener('gbg:unauthorized', handleUnauthorized)
   }, [])
 
-  // Load app data once the user lands in the app
   useEffect(() => {
     if (view === 'app') loadAll()
   }, [view])
 
   async function loadAll() {
     try {
-      const [d, v, s] = await Promise.all([getDepot(), getVehicles(), getStops()])
+      const [d, v, s, dr] = await Promise.all([getDepot(), getVehicles(), getStops(), getDrivers()])
       setDepot(d)
       setVehicles(v)
       setStops(s)
+      setDrivers(dr)
     } catch (e) {
       console.error('Failed to load data:', e)
     }
@@ -78,6 +74,7 @@ export default function App() {
     setDepot(null)
     setVehicles([])
     setStops([])
+    setDrivers([])
     setOptimizationResult(null)
     setView('landing')
   }
@@ -90,10 +87,7 @@ export default function App() {
     )
   }
 
-  const marketingProps = {
-    onSignIn: () => setView('login'),
-    onNavigate: setView,
-  }
+  const marketingProps = { onSignIn: () => setView('login'), onNavigate: setView }
 
   if (view === 'landing') return <LandingPage {...marketingProps} />
   if (view === 'about')   return <AboutPage   {...marketingProps} />
@@ -113,15 +107,28 @@ export default function App() {
             setDepot={setDepot}
             vehicles={vehicles}
             stops={stops}
+            drivers={drivers}
             optimizationResult={optimizationResult}
             setOptimizationResult={setOptimizationResult}
+            onVehiclesChange={setVehicles}
           />
         )}
         {tab === 'fleet' && (
-          <Fleet vehicles={vehicles} onVehiclesChange={setVehicles} />
+          <FleetView
+            vehicles={vehicles}
+            onVehiclesChange={setVehicles}
+            drivers={drivers}
+            onDriversChange={setDrivers}
+          />
         )}
         {tab === 'stops' && (
           <Stops stops={stops} onStopsChange={setStops} depot={depot} />
+        )}
+        {tab === 'analytics' && (
+          <AnalyticsView vehicles={vehicles} drivers={drivers} />
+        )}
+        {tab === 'planning' && (
+          <PlanningView vehicles={vehicles} stops={stops} onStopsChange={setStops} />
         )}
       </div>
     </div>
