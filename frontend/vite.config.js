@@ -7,8 +7,10 @@ export default defineConfig({
     port: 3000,
     proxy: {
       '/api': {
-        target: 'http://localhost:5001',
+        target: 'https://fleetpilot-xrgtf2sdta-uc.a.run.app',
         changeOrigin: true,
+        timeout: 30000,
+        proxyTimeout: 30000,
       },
     },
   },

@@ -5,15 +5,17 @@ import FleetView from './components/FleetView'
 import Stops from './components/Stops'
 import AnalyticsView from './components/AnalyticsView'
 import PlanningView from './components/PlanningView'
+import AccountView from './components/AccountView'
 import LoginPage from './components/LoginPage'
 import LandingPage from './components/LandingPage'
 import AboutPage from './components/AboutPage'
 import PricingPage from './components/PricingPage'
-import { getToken, clearToken, getMe, getDepot, getVehicles, getStops, getDrivers } from './api'
+import { getToken, setToken, clearToken, getMe, getDepot, getVehicles, getStops, getDrivers, verifyEmail } from './api'
 
 export default function App() {
   const [view, setView] = useState('loading')
   const [user, setUser] = useState(null)
+  const [pendingResetToken, setPendingResetToken] = useState(null)
 
   const [tab, setTab] = useState('map')
   const [depot, setDepot] = useState(null)
@@ -24,6 +26,30 @@ export default function App() {
 
   useEffect(() => {
     async function checkAuth() {
+      // Handle email verification link: ?verify=TOKEN
+      const params = new URLSearchParams(window.location.search)
+      const verifyToken = params.get('verify')
+      if (verifyToken) {
+        window.history.replaceState({}, '', '/')
+        try {
+          const result = await verifyEmail(verifyToken)
+          setToken(result.token)
+          setUser(result.user)
+          setView('app')
+        } catch {
+          setView('login')
+        }
+        return
+      }
+
+      const resetToken = params.get('reset')
+      if (resetToken) {
+        window.history.replaceState({}, '', '/')
+        setPendingResetToken(resetToken)
+        setView('login')
+        return
+      }
+
       const token = getToken()
       if (!token) { setView('landing'); return }
       try {
@@ -94,7 +120,7 @@ export default function App() {
   if (view === 'pricing') return <PricingPage {...marketingProps} />
 
   if (view === 'login') {
-    return <LoginPage onAuth={handleAuth} onBack={() => setView('landing')} />
+    return <LoginPage onAuth={handleAuth} onBack={() => setView('landing')} resetToken={pendingResetToken} onResetDone={() => setPendingResetToken(null)} />
   }
 
   return (
@@ -128,7 +154,10 @@ export default function App() {
           <AnalyticsView vehicles={vehicles} drivers={drivers} />
         )}
         {tab === 'planning' && (
-          <PlanningView vehicles={vehicles} stops={stops} onStopsChange={setStops} />
+          <PlanningView vehicles={vehicles} stops={stops} onStopsChange={setStops} drivers={drivers} />
+        )}
+        {tab === 'account' && (
+          <AccountView user={user} onUserChange={setUser} />
         )}
       </div>
     </div>

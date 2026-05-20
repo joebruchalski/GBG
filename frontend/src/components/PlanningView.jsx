@@ -1,14 +1,16 @@
 import { useState } from 'react'
-import { CalendarDays, ListChecks } from 'lucide-react'
+import { CalendarDays, ListChecks, TrendingUp } from 'lucide-react'
 import CalendarView from './CalendarView'
 import PlansView from './PlansView'
+import ForecastView from './ForecastView'
 
 const TABS = [
   { id: 'calendar', label: 'Calendar', icon: CalendarDays },
   { id: 'plans', label: 'Plans', icon: ListChecks },
+  { id: 'forecast', label: 'Forecast', icon: TrendingUp },
 ]
 
-export default function PlanningView({ vehicles, stops, onStopsChange }) {
+export default function PlanningView({ vehicles, stops, onStopsChange, drivers }) {
   const [subTab, setSubTab] = useState('calendar')
 
   return (
@@ -34,7 +36,8 @@ export default function PlanningView({ vehicles, stops, onStopsChange }) {
       {/* Sub-tab content */}
       <div className="flex-1 overflow-hidden">
         {subTab === 'calendar' && <CalendarView vehicles={vehicles} />}
-        {subTab === 'plans' && <PlansView vehicles={vehicles} stops={stops} onStopsChange={onStopsChange} />}
+        {subTab === 'plans' && <PlansView vehicles={vehicles} stops={stops} onStopsChange={onStopsChange} drivers={drivers} />}
+        {subTab === 'forecast' && <ForecastView vehicles={vehicles} drivers={drivers} />}
       </div>
     </div>
   )

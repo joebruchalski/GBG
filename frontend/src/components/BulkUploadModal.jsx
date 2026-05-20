@@ -8,6 +8,7 @@ export default function BulkUploadModal({ onClose, onSuccess }) {
   const [geocoding, setGeocoding] = useState(false)
   const [adding, setAdding] = useState(false)
   const [error, setError] = useState(null)
+  const [progress, setProgress] = useState({ done: 0, total: 0 })
 
   function parseText(raw) {
     return raw
@@ -34,9 +35,17 @@ export default function BulkUploadModal({ onClose, onSuccess }) {
     setGeocoding(true)
     setError(null)
     setResults(null)
+    setProgress({ done: 0, total: rows.length })
+    const BATCH = 25
+    const accumulated = []
     try {
-      const data = await bulkGeocode(rows)
-      setResults(data.results)
+      for (let i = 0; i < rows.length; i += BATCH) {
+        const chunk = rows.slice(i, i + BATCH)
+        const data = await bulkGeocode(chunk)
+        accumulated.push(...data.results)
+        setProgress({ done: Math.min(i + BATCH, rows.length), total: rows.length })
+      }
+      setResults(accumulated)
     } catch (e) {
       setError(e.message)
     } finally {
@@ -139,6 +148,21 @@ export default function BulkUploadModal({ onClose, onSuccess }) {
               >
                 ← Edit addresses
               </button>
+            </div>
+          )}
+
+          {geocoding && progress.total > 0 && (
+            <div className="space-y-1.5">
+              <div className="flex justify-between text-xs text-gray-500">
+                <span>Geocoding addresses…</span>
+                <span>{progress.done} / {progress.total}</span>
+              </div>
+              <div className="w-full bg-gray-100 rounded-full h-2">
+                <div
+                  className="bg-indigo-500 h-2 rounded-full transition-all duration-300"
+                  style={{ width: `${(progress.done / progress.total) * 100}%` }}
+                />
+              </div>
             </div>
           )}
 

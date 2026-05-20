@@ -42,10 +42,33 @@ const RECURRENCE_COLORS = {
 
 const DEFAULT_FORM = {
   title: '', scheduledDate: '', recurrence: 'none',
-  vehicleIds: [], stopIds: [], notes: '',
+  vehicleIds: [], stopIds: [], notes: '', driverAssignments: {},
 }
 
-export default function PlansView({ vehicles, stops, onStopsChange }) {
+function countInstances(startDateStr, recurrence) {
+  if (!startDateStr || recurrence === 'none') return 1
+  const start = new Date(startDateStr + 'T00:00:00')
+  const end = new Date(start)
+  end.setDate(end.getDate() + 90)
+  let count = 0
+  const d = new Date(start)
+  if (recurrence === 'weekly') {
+    while (d <= end) { count++; d.setDate(d.getDate() + 7) }
+  } else if (recurrence === 'biweekly') {
+    while (d <= end) { count++; d.setDate(d.getDate() + 14) }
+  } else if (recurrence === 'mwf') {
+    while (d <= end) { if ([1, 3, 5].includes(d.getDay())) count++; d.setDate(d.getDate() + 1) }
+  } else if (recurrence === 'tuth') {
+    while (d <= end) { if ([2, 4].includes(d.getDay())) count++; d.setDate(d.getDate() + 1) }
+  } else if (recurrence === 'weekdays') {
+    while (d <= end) { const day = d.getDay(); if (day >= 1 && day <= 5) count++; d.setDate(d.getDate() + 1) }
+  } else if (recurrence === 'monthly') {
+    while (d <= end) { count++; d.setMonth(d.getMonth() + 1) }
+  }
+  return count
+}
+
+export default function PlansView({ vehicles, stops, onStopsChange, drivers }) {
   const [plans, setPlans] = useState([])
   const [loading, setLoading] = useState(false)
   const [statusFilter, setStatusFilter] = useState('')
@@ -97,12 +120,22 @@ export default function PlansView({ vehicles, stops, onStopsChange }) {
   }
 
   function toggleVehicle(vid) {
-    setForm(f => ({
-      ...f,
-      vehicleIds: f.vehicleIds.includes(vid)
-        ? f.vehicleIds.filter(v => v !== vid)
-        : [...f.vehicleIds, vid],
-    }))
+    setForm(f => {
+      const adding = !f.vehicleIds.includes(vid)
+      const newVehicleIds = adding
+        ? [...f.vehicleIds, vid]
+        : f.vehicleIds.filter(v => v !== vid)
+      const newAssignments = { ...f.driverAssignments }
+      if (adding) {
+        const vehicle = vehicles?.find(v => v.id === vid)
+        if (vehicle?.defaultDriverId && !newAssignments[vid]) {
+          newAssignments[vid] = vehicle.defaultDriverId
+        }
+      } else {
+        delete newAssignments[vid]
+      }
+      return { ...f, vehicleIds: newVehicleIds, driverAssignments: newAssignments }
+    })
   }
   function toggleStop(sid) {
     setForm(f => ({
@@ -189,6 +222,12 @@ export default function PlansView({ vehicles, stops, onStopsChange }) {
                     </div>
                   </div>
 
+                  {form.recurrence !== 'none' && form.scheduledDate && (
+                    <p className="text-xs text-indigo-600 bg-indigo-50 rounded-md px-2.5 py-1.5">
+                      ~{countInstances(form.scheduledDate, form.recurrence)} runs will be scheduled over 90 days
+                    </p>
+                  )}
+
                   {vehicles?.length > 0 && (
                     <div>
                       <label className="block text-xs font-medium text-gray-700 mb-1">Vehicles</label>
@@ -203,6 +242,41 @@ export default function PlansView({ vehicles, stops, onStopsChange }) {
                             <Truck size={11} /> {v.name}
                           </label>
                         ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {form.vehicleIds.length > 0 && drivers?.length > 0 && (
+                    <div>
+                      <label className="block text-xs font-medium text-gray-700 mb-1">Driver Assignments</label>
+                      <div className="space-y-1.5">
+                        {form.vehicleIds.map(vid => {
+                          const v = vehicleMap[vid]
+                          return (
+                            <div key={vid} className="flex items-center gap-2">
+                              <span className="text-xs text-gray-600 flex items-center gap-1 flex-1 min-w-0 truncate">
+                                <Truck size={10} className="shrink-0" /> {v?.name || vid}
+                              </span>
+                              <select
+                                value={form.driverAssignments[vid] || ''}
+                                onChange={e => {
+                                  const val = e.target.value
+                                  setForm(f => {
+                                    const a = { ...f.driverAssignments }
+                                    if (val) a[vid] = val; else delete a[vid]
+                                    return { ...f, driverAssignments: a }
+                                  })
+                                }}
+                                className="border border-gray-200 rounded-md px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-indigo-400 w-36 shrink-0"
+                              >
+                                <option value="">Unassigned</option>
+                                {drivers.map(d => (
+                                  <option key={d.id} value={d.id}>{d.name}</option>
+                                ))}
+                              </select>
+                            </div>
+                          )
+                        })}
                       </div>
                     </div>
                   )}

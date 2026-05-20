@@ -1,0 +1,31 @@
+# Python
+backend/.venv/
+backend/__pycache__/
+backend/instance/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Database
+*.db
+*.sqlite
+
+# Frontend build
+frontend/dist/
+frontend/node_modules/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# GCP credentials
+*.json.key
+service-account*.json

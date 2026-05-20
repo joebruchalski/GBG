@@ -22,8 +22,9 @@ async function req(path, opts = {}) {
     window.dispatchEvent(new Event('gbg:unauthorized'))
   }
 
-  const body = await res.json()
-  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`)
+  const isJson = res.headers.get('content-type')?.includes('application/json')
+  const body = isJson ? await res.json() : await res.text()
+  if (!res.ok) throw new Error((isJson && body.error) || body || `HTTP ${res.status}`)
   return body
 }
 
@@ -35,6 +36,16 @@ export const register = (name, email, password) =>
   req('/auth/register', { method: 'POST', body: JSON.stringify({ name, email, password }) })
 
 export const getMe = () => req('/auth/me')
+export const updateMe = (data) => req('/auth/me', { method: 'PATCH', body: JSON.stringify(data) })
+export const changePassword = (current_password, new_password) =>
+  req('/auth/change-password', { method: 'POST', body: JSON.stringify({ current_password, new_password }) })
+export const verifyEmail = (token) => req(`/auth/verify-email?token=${encodeURIComponent(token)}`)
+export const resendVerification = (email) =>
+  req('/auth/resend-verification', { method: 'POST', body: JSON.stringify({ email }) })
+export const forgotPassword = (email) =>
+  req('/auth/forgot-password', { method: 'POST', body: JSON.stringify({ email }) })
+export const resetPassword = (token, password) =>
+  req('/auth/reset-password', { method: 'POST', body: JSON.stringify({ token, password }) })
 
 // ── Depot ─────────────────────────────────────────────────────────────────────
 export const getDepot = () => req('/depot')
@@ -109,6 +120,10 @@ export const updateScheduledRoute = (id, data) =>
   req(`/schedule/${id}`, { method: 'PUT', body: JSON.stringify(data) })
 export const deleteScheduledRoute = (id) =>
   req(`/schedule/${id}`, { method: 'DELETE' })
+
+// ── Forecast ──────────────────────────────────────────────────────────────────
+export const getForecast = (period) =>
+  req(`/forecast${period ? '?period=' + period : ''}`)
 
 // ── Bulk Stops ────────────────────────────────────────────────────────────────
 export const bulkGeocode = (rows) =>

@@ -4,6 +4,7 @@ GBG Fleet Route Optimizer — Flask Backend API
 
 import json
 import os
+import secrets
 import time
 import numpy as np
 import requests as http_requests
@@ -19,6 +20,8 @@ from flask_jwt_extended import (
 )
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import check_password_hash, generate_password_hash
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 from optimization.scheduler import (
     Location,
@@ -32,16 +35,19 @@ from optimization.scheduler import (
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-key")
-app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
-    "DATABASE_URL", "sqlite:///gbg_routes.db"
-)
+app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("DATABASE_URL") or "sqlite:///gbg_routes.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET_KEY", "jwt-dev-secret-change-in-prod")
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(days=7)
 
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+RESEND_FROM = os.environ.get("RESEND_FROM_EMAIL", "onboarding@resend.dev")
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://gbgfleetpilot.web.app")
+
 db = SQLAlchemy(app)
 JWTManager(app)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
+limiter = Limiter(get_remote_address, app=app, default_limits=[], storage_uri="memory://")
 
 
 # ── Models ───────────────────────────────────────────────────────────────────
@@ -56,6 +62,7 @@ class Depot(db.Model):
     updated_at = db.Column(
         db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
     )
+    user_id = db.Column(db.String(50), nullable=True)
 
     def to_dict(self):
         return {
@@ -81,6 +88,7 @@ class Vehicle(db.Model):
     last_oil_change_date = db.Column(db.Date, nullable=True)
     oil_change_interval_months = db.Column(db.Integer, default=6)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    user_id = db.Column(db.String(50), nullable=True)
 
     def to_dict(self):
         from datetime import date as date_type
@@ -127,6 +135,7 @@ class Driver(db.Model):
     notes = db.Column(db.Text)
     active = db.Column(db.Boolean, default=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    user_id = db.Column(db.String(50), nullable=True)
 
     def to_dict(self):
         return {
@@ -146,8 +155,11 @@ class DeliveryStop(db.Model):
     latitude = db.Column(db.Float, nullable=False)
     longitude = db.Column(db.Float, nullable=False)
     notes = db.Column(db.Text)
+    tags = db.Column(db.Text, nullable=True)
+    custom_fields = db.Column(db.Text, nullable=True)
     active = db.Column(db.Boolean, default=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    user_id = db.Column(db.String(50), nullable=True)
 
     def to_dict(self):
         return {
@@ -157,6 +169,8 @@ class DeliveryStop(db.Model):
             "latitude": self.latitude,
             "longitude": self.longitude,
             "notes": self.notes or "",
+            "tags": json.loads(self.tags) if self.tags else [],
+            "customFields": json.loads(self.custom_fields) if self.custom_fields else [],
         }
 
 
@@ -170,6 +184,7 @@ class OptimizationRun(db.Model):
     num_stops = db.Column(db.Integer)
     run_date = db.Column(db.Date, nullable=True)
     notes = db.Column(db.Text, nullable=True)
+    user_id = db.Column(db.String(50), nullable=True)
 
 
 class RouteLog(db.Model):
@@ -185,6 +200,7 @@ class RouteLog(db.Model):
     estimated_minutes = db.Column(db.Integer, default=0)
     stops_count = db.Column(db.Integer, default=0)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    user_id = db.Column(db.String(50), nullable=True)
 
     def to_dict(self):
         return {
@@ -212,7 +228,10 @@ class ScheduledRoute(db.Model):
     stop_ids_json = db.Column(db.Text)     # JSON array of delivery stop IDs
     status = db.Column(db.String(20), default="planned")  # planned | completed | cancelled
     recurrence = db.Column(db.String(20), default="none")  # none | weekly | biweekly | monthly
+    parent_id = db.Column(db.String(50), nullable=True)   # set on instances; null on masters/one-time
+    driver_assignments_json = db.Column(db.Text)           # JSON: {vehicleId: driverId}
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    user_id = db.Column(db.String(50), nullable=True)
 
     def to_dict(self):
         return {
@@ -224,6 +243,8 @@ class ScheduledRoute(db.Model):
             "stopIds": json.loads(self.stop_ids_json) if self.stop_ids_json else [],
             "status": self.status,
             "recurrence": self.recurrence or "none",
+            "parentId": self.parent_id,
+            "driverAssignments": json.loads(self.driver_assignments_json) if self.driver_assignments_json else {},
         }
 
 
@@ -233,10 +254,32 @@ class User(db.Model):
     name = db.Column(db.String(100), nullable=False)
     email = db.Column(db.String(100), unique=True, nullable=False)
     password_hash = db.Column(db.String(256), nullable=False)
+    email_verified = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    org_name = db.Column(db.String(100), nullable=True)
 
     def to_dict(self):
-        return {"id": self.id, "name": self.name, "email": self.email}
+        return {
+            "id": self.id,
+            "name": self.name,
+            "email": self.email,
+            "org_name": self.org_name or "",
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class EmailVerification(db.Model):
+    __tablename__ = "email_verifications"
+    token = db.Column(db.String(100), primary_key=True)
+    user_id = db.Column(db.String(50), nullable=False)
+    expires_at = db.Column(db.DateTime, nullable=False)
+
+
+class PasswordReset(db.Model):
+    __tablename__ = "password_resets"
+    token = db.Column(db.String(100), primary_key=True)
+    user_id = db.Column(db.String(50), nullable=False)
+    expires_at = db.Column(db.DateTime, nullable=False)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -300,10 +343,76 @@ def _osrm_route(locs: list):
     return None, None, None
 
 
+# ── Email helper ─────────────────────────────────────────────────────────────
+
+
+def _send_verification_email(user, token):
+    """Returns True if email was sent, False if skipped or failed."""
+    if not RESEND_API_KEY:
+        app.logger.warning("RESEND_API_KEY not set — skipping verification email")
+        return False
+    import resend
+    resend.api_key = RESEND_API_KEY
+    link = f"{FRONTEND_URL}/?verify={token}"
+    try:
+        resend.Emails.send({
+            "from": RESEND_FROM,
+            "to": [user.email],
+            "subject": "Verify your FleetPilot account",
+            "html": f"""
+            <div style="font-family:sans-serif;max-width:480px;margin:0 auto">
+              <h2 style="color:#4f46e5">Welcome to FleetPilot, {user.name}!</h2>
+              <p>Click the button below to verify your email address. This link expires in 24 hours.</p>
+              <a href="{link}" style="display:inline-block;padding:12px 24px;background:#4f46e5;
+                 color:#fff;border-radius:8px;text-decoration:none;font-weight:600;margin:16px 0">
+                Verify Email
+              </a>
+              <p style="color:#6b7280;font-size:13px">Or copy this link: {link}</p>
+            </div>
+            """,
+        })
+        return True
+    except Exception as e:
+        app.logger.warning(f"Failed to send verification email to {user.email}: {e}")
+        return False
+
+
+def _send_password_reset_email(user, token):
+    link = f"{FRONTEND_URL}/?reset={token}"
+    if not RESEND_API_KEY:
+        app.logger.warning(f"[DEV] Password reset link for {user.email}: {link}")
+        return False
+    import resend
+    resend.api_key = RESEND_API_KEY
+    try:
+        resend.Emails.send({
+            "from": RESEND_FROM,
+            "to": [user.email],
+            "subject": "Reset your FleetPilot password",
+            "html": f"""
+            <div style="font-family:sans-serif;max-width:480px;margin:0 auto">
+              <h2 style="color:#4f46e5">Reset your password</h2>
+              <p>Click below to set a new password. This link expires in 1 hour.</p>
+              <a href="{link}" style="display:inline-block;padding:12px 24px;background:#4f46e5;
+                 color:#fff;border-radius:8px;text-decoration:none;font-weight:600;margin:16px 0">
+                Reset Password
+              </a>
+              <p style="color:#6b7280;font-size:13px">Or copy this link: {link}</p>
+              <p style="color:#9ca3af;font-size:12px">If you didn't request this, ignore this email.</p>
+            </div>
+            """,
+        })
+        return True
+    except Exception as e:
+        app.logger.warning(f"Failed to send reset email to {user.email}: {e}")
+        return False
+
+
 # ── Routes: Auth ─────────────────────────────────────────────────────────────
 
 
 @app.route("/api/auth/register", methods=["POST"])
+@limiter.limit("5 per minute")
 def register():
     data = request.json or {}
     name = data.get("name", "").strip()
@@ -322,15 +431,33 @@ def register():
         name=name,
         email=email,
         password_hash=generate_password_hash(password),
+        email_verified=False,
     )
     db.session.add(user)
+
+    verify_token = secrets.token_urlsafe(32)
+    ev = EmailVerification(
+        token=verify_token,
+        user_id=user.id,
+        expires_at=datetime.utcnow() + timedelta(hours=24),
+    )
+    db.session.add(ev)
     db.session.commit()
 
-    token = create_access_token(identity=user.id)
-    return jsonify({"token": token, "user": user.to_dict()}), 201
+    email_sent = _send_verification_email(user, verify_token)
+    if not email_sent:
+        # Auto-verify when email delivery isn't available (Resend trial/no key)
+        user.email_verified = True
+        db.session.delete(ev)
+        db.session.commit()
+        jwt_token = create_access_token(identity=user.id)
+        return jsonify({"token": jwt_token, "user": user.to_dict()}), 201
+
+    return jsonify({"message": "Check your email to verify your account", "email": email}), 201
 
 
 @app.route("/api/auth/login", methods=["POST"])
+@limiter.limit("10 per minute")
 def login():
     data = request.json or {}
     email = data.get("email", "").strip().lower()
@@ -339,18 +466,125 @@ def login():
     user = User.query.filter_by(email=email).first()
     if not user or not check_password_hash(user.password_hash, password):
         return jsonify({"error": "Invalid email or password"}), 401
+    if not user.email_verified:
+        return jsonify({"error": "Please verify your email before signing in", "unverified": True}), 403
 
     token = create_access_token(identity=user.id)
     return jsonify({"token": token, "user": user.to_dict()})
 
 
-@app.route("/api/auth/me", methods=["GET"])
+@app.route("/api/auth/verify-email", methods=["GET"])
+def verify_email():
+    token = request.args.get("token", "")
+    ev = db.session.get(EmailVerification, token)
+    if not ev or ev.expires_at < datetime.utcnow():
+        return jsonify({"error": "Invalid or expired verification link"}), 400
+    user = db.session.get(User, ev.user_id)
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    user.email_verified = True
+    db.session.delete(ev)
+    db.session.commit()
+    jwt_token = create_access_token(identity=user.id)
+    return jsonify({"token": jwt_token, "user": user.to_dict()})
+
+
+@app.route("/api/auth/resend-verification", methods=["POST"])
+@limiter.limit("5 per minute")
+def resend_verification():
+    email = (request.json or {}).get("email", "").strip().lower()
+    user = User.query.filter_by(email=email).first()
+    # Return 200 regardless to avoid email enumeration
+    if not user or user.email_verified:
+        return jsonify({"message": "If that account exists and is unverified, a new link was sent"}), 200
+    EmailVerification.query.filter_by(user_id=user.id).delete()
+    verify_token = secrets.token_urlsafe(32)
+    ev = EmailVerification(
+        token=verify_token,
+        user_id=user.id,
+        expires_at=datetime.utcnow() + timedelta(hours=24),
+    )
+    db.session.add(ev)
+    db.session.commit()
+    _send_verification_email(user, verify_token)
+    return jsonify({"message": "Verification email sent"}), 200
+
+
+@app.route("/api/auth/me", methods=["GET", "PATCH"])
 @jwt_required()
-def get_me():
+def me():
     user = db.session.get(User, get_jwt_identity())
     if not user:
         return jsonify({"error": "User not found"}), 404
+    if request.method == "GET":
+        return jsonify(user.to_dict())
+    data = request.json or {}
+    if "name" in data:
+        name = data["name"].strip()
+        if not name:
+            return jsonify({"error": "Name cannot be empty"}), 400
+        user.name = name
+    if "org_name" in data:
+        user.org_name = data["org_name"].strip()
+    db.session.commit()
     return jsonify(user.to_dict())
+
+
+@app.route("/api/auth/change-password", methods=["POST"])
+@jwt_required()
+def change_password():
+    user = db.session.get(User, get_jwt_identity())
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    data = request.json or {}
+    current = data.get("current_password", "")
+    new_pw = data.get("new_password", "")
+    if not check_password_hash(user.password_hash, current):
+        return jsonify({"error": "Current password is incorrect"}), 400
+    if len(new_pw) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
+    user.password_hash = generate_password_hash(new_pw)
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/auth/forgot-password", methods=["POST"])
+@limiter.limit("5 per minute")
+def forgot_password():
+    email = (request.json or {}).get("email", "").strip().lower()
+    user = User.query.filter_by(email=email).first()
+    if user and user.email_verified:
+        PasswordReset.query.filter_by(user_id=user.id).delete()
+        reset_token = secrets.token_urlsafe(32)
+        pr = PasswordReset(
+            token=reset_token,
+            user_id=user.id,
+            expires_at=datetime.utcnow() + timedelta(hours=1),
+        )
+        db.session.add(pr)
+        db.session.commit()
+        _send_password_reset_email(user, reset_token)
+    return jsonify({"message": "If that account exists, a reset link was sent"}), 200
+
+
+@app.route("/api/auth/reset-password", methods=["POST"])
+@limiter.limit("5 per minute")
+def reset_password():
+    data = request.json or {}
+    token = data.get("token", "")
+    password = data.get("password", "")
+    if len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
+    pr = db.session.get(PasswordReset, token)
+    if not pr or pr.expires_at < datetime.utcnow():
+        return jsonify({"error": "Invalid or expired reset link"}), 400
+    user = db.session.get(User, pr.user_id)
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    user.password_hash = generate_password_hash(password)
+    db.session.delete(pr)
+    db.session.commit()
+    return jsonify({"message": "Password updated. You can now sign in."})
 
 
 # ── Routes: Geocoding ─────────────────────────────────────────────────────────
@@ -419,15 +653,17 @@ def geocode():
 @app.route("/api/depot", methods=["GET"])
 @jwt_required()
 def get_depot():
-    depot = Depot.query.first()
+    uid = get_jwt_identity()
+    depot = Depot.query.filter_by(user_id=uid).first()
     return jsonify(depot.to_dict() if depot else None)
 
 
 @app.route("/api/depot", methods=["POST"])
 @jwt_required()
 def set_depot():
+    uid = get_jwt_identity()
     data = request.json or {}
-    depot = Depot.query.first()
+    depot = Depot.query.filter_by(user_id=uid).first()
     if depot:
         depot.address = data["address"]
         depot.latitude = data["lat"]
@@ -437,6 +673,7 @@ def set_depot():
             address=data["address"],
             latitude=data["lat"],
             longitude=data["lng"],
+            user_id=uid,
         )
         db.session.add(depot)
     db.session.commit()
@@ -449,13 +686,15 @@ def set_depot():
 @app.route("/api/vehicles", methods=["GET"])
 @jwt_required()
 def get_vehicles():
-    vehicles = Vehicle.query.filter_by(active=True).order_by(Vehicle.created_at).all()
+    uid = get_jwt_identity()
+    vehicles = Vehicle.query.filter_by(active=True, user_id=uid).order_by(Vehicle.created_at).all()
     return jsonify([v.to_dict() for v in vehicles])
 
 
 @app.route("/api/vehicles", methods=["POST"])
 @jwt_required()
 def create_vehicle():
+    uid = get_jwt_identity()
     data = request.json or {}
     v = Vehicle(
         id=_new_id("V"),
@@ -468,6 +707,7 @@ def create_vehicle():
         default_driver_id=data.get("defaultDriverId") or None,
         oil_change_interval_miles=float(data.get("oilChangeIntervalMiles", 5000.0)),
         oil_change_interval_months=int(data.get("oilChangeIntervalMonths", 6)),
+        user_id=uid,
     )
     db.session.add(v)
     db.session.commit()
@@ -477,8 +717,9 @@ def create_vehicle():
 @app.route("/api/vehicles/<vid>", methods=["PUT"])
 @jwt_required()
 def update_vehicle(vid):
+    uid = get_jwt_identity()
     v = db.session.get(Vehicle, vid)
-    if not v:
+    if not v or v.user_id != uid:
         return jsonify({"error": "Not found"}), 404
     data = request.json or {}
     mapping = {
@@ -502,8 +743,9 @@ def update_vehicle(vid):
 @app.route("/api/vehicles/<vid>", methods=["DELETE"])
 @jwt_required()
 def delete_vehicle(vid):
+    uid = get_jwt_identity()
     v = db.session.get(Vehicle, vid)
-    if not v:
+    if not v or v.user_id != uid:
         return jsonify({"error": "Not found"}), 404
     v.active = False
     db.session.commit()
@@ -513,8 +755,9 @@ def delete_vehicle(vid):
 @app.route("/api/vehicles/<vid>/oil-change", methods=["POST"])
 @jwt_required()
 def log_oil_change(vid):
+    uid = get_jwt_identity()
     v = db.session.get(Vehicle, vid)
-    if not v:
+    if not v or v.user_id != uid:
         return jsonify({"error": "Not found"}), 404
     from datetime import date as date_type
     v.miles_since_oil_change = 0.0
@@ -526,14 +769,15 @@ def log_oil_change(vid):
 @app.route("/api/vehicles/<vid>/default-driver", methods=["PUT"])
 @jwt_required()
 def set_default_driver(vid):
+    uid = get_jwt_identity()
     v = db.session.get(Vehicle, vid)
-    if not v:
+    if not v or v.user_id != uid:
         return jsonify({"error": "Not found"}), 404
     data = request.json or {}
     driver_id = data.get("driverId")
     if driver_id:
         d = db.session.get(Driver, driver_id)
-        if not d:
+        if not d or d.user_id != uid:
             return jsonify({"error": "Driver not found"}), 404
     v.default_driver_id = driver_id or None
     db.session.commit()
@@ -545,13 +789,15 @@ def set_default_driver(vid):
 @app.route("/api/drivers", methods=["GET"])
 @jwt_required()
 def get_drivers():
-    drivers = Driver.query.filter_by(active=True).order_by(Driver.name).all()
+    uid = get_jwt_identity()
+    drivers = Driver.query.filter_by(active=True, user_id=uid).order_by(Driver.name).all()
     return jsonify([d.to_dict() for d in drivers])
 
 
 @app.route("/api/drivers", methods=["POST"])
 @jwt_required()
 def create_driver():
+    uid = get_jwt_identity()
     data = request.json or {}
     if not data.get("name", "").strip():
         return jsonify({"error": "Name is required"}), 400
@@ -561,6 +807,7 @@ def create_driver():
         phone=data.get("phone"),
         email=data.get("email"),
         notes=data.get("notes"),
+        user_id=uid,
     )
     db.session.add(d)
     db.session.commit()
@@ -570,8 +817,9 @@ def create_driver():
 @app.route("/api/drivers/<did>", methods=["PUT"])
 @jwt_required()
 def update_driver(did):
+    uid = get_jwt_identity()
     d = db.session.get(Driver, did)
-    if not d:
+    if not d or d.user_id != uid:
         return jsonify({"error": "Not found"}), 404
     data = request.json or {}
     for field in ("name", "phone", "email", "notes"):
@@ -584,8 +832,9 @@ def update_driver(did):
 @app.route("/api/drivers/<did>", methods=["DELETE"])
 @jwt_required()
 def delete_driver(did):
+    uid = get_jwt_identity()
     d = db.session.get(Driver, did)
-    if not d:
+    if not d or d.user_id != uid:
         return jsonify({"error": "Not found"}), 404
     d.active = False
     db.session.commit()
@@ -598,8 +847,9 @@ def delete_driver(did):
 @app.route("/api/stops", methods=["GET"])
 @jwt_required()
 def get_stops():
+    uid = get_jwt_identity()
     stops = (
-        DeliveryStop.query.filter_by(active=True)
+        DeliveryStop.query.filter_by(active=True, user_id=uid)
         .order_by(DeliveryStop.created_at)
         .all()
     )
@@ -609,7 +859,10 @@ def get_stops():
 @app.route("/api/stops", methods=["POST"])
 @jwt_required()
 def create_stop():
+    uid = get_jwt_identity()
     data = request.json or {}
+    tags = data.get("tags", [])
+    custom_fields = data.get("customFields", [])
     s = DeliveryStop(
         id=_new_id("S"),
         recipient_name=data["recipientName"],
@@ -617,6 +870,9 @@ def create_stop():
         latitude=float(data["latitude"]),
         longitude=float(data["longitude"]),
         notes=data.get("notes"),
+        tags=json.dumps(tags) if tags else None,
+        custom_fields=json.dumps(custom_fields) if custom_fields else None,
+        user_id=uid,
     )
     db.session.add(s)
     db.session.commit()
@@ -626,8 +882,9 @@ def create_stop():
 @app.route("/api/stops/<sid>", methods=["DELETE"])
 @jwt_required()
 def delete_stop(sid):
+    uid = get_jwt_identity()
     s = db.session.get(DeliveryStop, sid)
-    if not s:
+    if not s or s.user_id != uid:
         return jsonify({"error": "Not found"}), 404
     s.active = False
     db.session.commit()
@@ -640,7 +897,7 @@ def bulk_geocode():
     """Geocode a list of {name, address, notes} rows. Returns results with lat/lng or error per row."""
     rows = (request.json or {}).get("rows", [])
     results = []
-    for row in rows[:100]:  # cap at 100
+    for row in rows[:200]:
         address = (row.get("address") or "").strip()
         if not address:
             results.append({**row, "error": "No address provided", "ok": False})
@@ -650,6 +907,7 @@ def bulk_geocode():
             results.append({**row, **geo, "ok": True})
         else:
             results.append({**row, "error": "Address not found", "ok": False})
+        time.sleep(0.1)
     return jsonify({"results": results})
 
 
@@ -659,9 +917,12 @@ def bulk_create_stops():
     """Create multiple stops from pre-geocoded rows."""
     rows = (request.json or {}).get("rows", [])
     created = []
+    uid = get_jwt_identity()
     for row in rows[:100]:
         if not row.get("ok") or not row.get("lat") or not row.get("lng"):
             continue
+        tags = row.get("tags", [])
+        custom_fields = row.get("customFields", [])
         s = DeliveryStop(
             id=_new_id("S"),
             recipient_name=(row.get("name") or "").strip() or "Unknown",
@@ -669,6 +930,9 @@ def bulk_create_stops():
             latitude=float(row["lat"]),
             longitude=float(row["lng"]),
             notes=row.get("notes"),
+            tags=json.dumps(tags) if tags else None,
+            custom_fields=json.dumps(custom_fields) if custom_fields else None,
+            user_id=uid,
         )
         db.session.add(s)
         created.append(s)
@@ -681,10 +945,11 @@ def bulk_create_stops():
 @app.route("/api/history", methods=["GET"])
 @jwt_required()
 def get_history():
+    uid = get_jwt_identity()
     vehicle_id = request.args.get("vehicleId")
     driver_id = request.args.get("driverId")
     limit = min(int(request.args.get("limit", 200)), 500)
-    q = RouteLog.query
+    q = RouteLog.query.filter_by(user_id=uid)
     if vehicle_id:
         q = q.filter_by(vehicle_id=vehicle_id)
     if driver_id:
@@ -701,7 +966,8 @@ def get_history():
 def run_optimization():
     data = request.json or {}
 
-    depot = Depot.query.first()
+    uid = get_jwt_identity()
+    depot = Depot.query.filter_by(user_id=uid).first()
     if not depot:
         return jsonify({"error": "No depot set. Configure a depot location first."}), 400
 
@@ -710,17 +976,17 @@ def run_optimization():
 
     if vehicle_ids:
         db_vehicles = Vehicle.query.filter(
-            Vehicle.id.in_(vehicle_ids), Vehicle.active == True
+            Vehicle.id.in_(vehicle_ids), Vehicle.active == True, Vehicle.user_id == uid
         ).all()
     else:
-        db_vehicles = Vehicle.query.filter_by(active=True).all()
+        db_vehicles = Vehicle.query.filter_by(active=True, user_id=uid).all()
 
     if stop_ids:
         db_stops = DeliveryStop.query.filter(
-            DeliveryStop.id.in_(stop_ids), DeliveryStop.active == True
+            DeliveryStop.id.in_(stop_ids), DeliveryStop.active == True, DeliveryStop.user_id == uid
         ).all()
     else:
-        db_stops = DeliveryStop.query.filter_by(active=True).all()
+        db_stops = DeliveryStop.query.filter_by(active=True, user_id=uid).all()
 
     if not db_vehicles:
         return jsonify({"error": "No active vehicles found"}), 400
@@ -822,6 +1088,7 @@ def run_optimization():
 @jwt_required()
 def save_optimization():
     """Persist a route plan, log per-vehicle records, and update odometers + oil change counters."""
+    uid = get_jwt_identity()
     from datetime import date as date_type
     data = request.json or {}
     routes = data.get("routes", [])
@@ -841,6 +1108,7 @@ def save_optimization():
         num_stops=sum(len(r.get("stops", [])) for r in routes),
         run_date=run_date,
         notes=notes or None,
+        user_id=uid,
     )
     db.session.add(run)
 
@@ -866,11 +1134,85 @@ def save_optimization():
             miles=miles,
             estimated_minutes=r.get("estimatedMinutes", 0),
             stops_count=len(r.get("stops", [])),
+            user_id=uid,
         )
         db.session.add(log)
 
     db.session.commit()
     return jsonify({"runId": run.id, "message": "Saved and odometers updated"})
+
+
+# ── Recurrence helpers ────────────────────────────────────────────────────────
+
+
+def _expand_recurrence(start_date, recurrence, horizon_days=90):
+    """Return list of dates matching recurrence pattern starting from start_date."""
+    from datetime import timedelta
+    import calendar as cal_mod
+
+    end = start_date + timedelta(days=horizon_days)
+    dates = []
+
+    if recurrence == "none":
+        return [start_date]
+    if recurrence == "weekly":
+        d = start_date
+        while d <= end:
+            dates.append(d)
+            d += timedelta(days=7)
+    elif recurrence == "biweekly":
+        d = start_date
+        while d <= end:
+            dates.append(d)
+            d += timedelta(days=14)
+    elif recurrence in ("mwf", "tuth", "weekdays"):
+        target = {"mwf": {0, 2, 4}, "tuth": {1, 3}, "weekdays": {0, 1, 2, 3, 4}}[recurrence]
+        d = start_date
+        while d <= end:
+            if d.weekday() in target:
+                dates.append(d)
+            d += timedelta(days=1)
+    elif recurrence == "monthly":
+        d = start_date
+        while d <= end:
+            dates.append(d)
+            month = d.month + 1
+            year = d.year
+            if month > 12:
+                month, year = 1, year + 1
+            last_day = cal_mod.monthrange(year, month)[1]
+            d = d.replace(year=year, month=month, day=min(d.day, last_day))
+
+    return dates
+
+
+def _sync_instances(master, from_date=None):
+    """Regenerate future planned instances for a recurring master plan."""
+    from datetime import date as date_type
+
+    start = from_date or master.scheduled_date
+    # Delete future planned instances only — preserve completed/cancelled history
+    ScheduledRoute.query.filter(
+        ScheduledRoute.parent_id == master.id,
+        ScheduledRoute.status == "planned",
+        ScheduledRoute.scheduled_date >= start,
+    ).delete()
+
+    for date in _expand_recurrence(start, master.recurrence):
+        inst = ScheduledRoute(
+            id=_new_id("SC"),
+            title=master.title,
+            scheduled_date=date,
+            notes=master.notes,
+            vehicle_ids_json=master.vehicle_ids_json,
+            stop_ids_json=master.stop_ids_json,
+            driver_assignments_json=master.driver_assignments_json,
+            status="planned",
+            recurrence="none",
+            parent_id=master.id,
+            user_id=master.user_id,
+        )
+        db.session.add(inst)
 
 
 # ── Routes: Schedule ──────────────────────────────────────────────────────────
@@ -879,23 +1221,30 @@ def save_optimization():
 @jwt_required()
 def get_calendar():
     """Returns scheduled routes + route logs for a given year/month."""
+    uid = get_jwt_identity()
     from datetime import date as date_type
     year = int(request.args.get("year", date_type.today().year))
     month = int(request.args.get("month", date_type.today().month))
-    # first and last day of month
     import calendar as cal_mod
     first = date_type(year, month, 1)
     last_day = cal_mod.monthrange(year, month)[1]
     last = date_type(year, month, last_day)
 
+    from sqlalchemy import or_
     scheduled = ScheduledRoute.query.filter(
         ScheduledRoute.scheduled_date >= first,
         ScheduledRoute.scheduled_date <= last,
+        ScheduledRoute.user_id == uid,
+        or_(
+            ScheduledRoute.parent_id.isnot(None),
+            ScheduledRoute.recurrence == "none",
+        ),
     ).order_by(ScheduledRoute.scheduled_date).all()
 
     logs = RouteLog.query.filter(
         RouteLog.run_date >= first,
         RouteLog.run_date <= last,
+        RouteLog.user_id == uid,
     ).order_by(RouteLog.run_date).all()
 
     return jsonify({
@@ -907,6 +1256,7 @@ def get_calendar():
 @app.route("/api/schedule", methods=["POST"])
 @jwt_required()
 def create_scheduled_route():
+    uid = get_jwt_identity()
     from datetime import date as date_type
     data = request.json or {}
     if not data.get("title", "").strip():
@@ -924,10 +1274,14 @@ def create_scheduled_route():
         notes=data.get("notes"),
         vehicle_ids_json=json.dumps(data.get("vehicleIds", [])),
         stop_ids_json=json.dumps(data.get("stopIds", [])),
+        driver_assignments_json=json.dumps(data.get("driverAssignments", {})),
         status="planned",
         recurrence=data.get("recurrence", "none"),
+        user_id=uid,
     )
     db.session.add(s)
+    if s.recurrence != "none":
+        _sync_instances(s)
     db.session.commit()
     return jsonify(s.to_dict()), 201
 
@@ -935,11 +1289,17 @@ def create_scheduled_route():
 @app.route("/api/schedule/<sid>", methods=["PUT"])
 @jwt_required()
 def update_scheduled_route(sid):
+    uid = get_jwt_identity()
     from datetime import date as date_type
     s = db.session.get(ScheduledRoute, sid)
-    if not s:
+    if not s or s.user_id != uid:
         return jsonify({"error": "Not found"}), 404
     data = request.json or {}
+
+    old_recurrence = s.recurrence
+    old_date = s.scheduled_date
+    schedule_changed = False
+
     if "title" in data:
         s.title = data["title"].strip()
     if "notes" in data:
@@ -950,13 +1310,35 @@ def update_scheduled_route(sid):
         s.vehicle_ids_json = json.dumps(data["vehicleIds"])
     if "scheduledDate" in data:
         try:
-            s.scheduled_date = date_type.fromisoformat(data["scheduledDate"])
+            new_date = date_type.fromisoformat(data["scheduledDate"])
+            if new_date != old_date:
+                schedule_changed = True
+            s.scheduled_date = new_date
         except ValueError:
             pass
     if "recurrence" in data:
+        if data["recurrence"] != old_recurrence:
+            schedule_changed = True
         s.recurrence = data["recurrence"]
     if "stopIds" in data:
         s.stop_ids_json = json.dumps(data["stopIds"])
+    if "driverAssignments" in data:
+        s.driver_assignments_json = json.dumps(data["driverAssignments"])
+
+    # Master plan: sync instances when schedule changes, otherwise propagate content
+    is_master = s.parent_id is None and s.recurrence != "none"
+    if is_master:
+        if schedule_changed:
+            _sync_instances(s, from_date=date_type.today())
+        else:
+            ScheduledRoute.query.filter_by(parent_id=s.id, status="planned").update({
+                "title": s.title,
+                "notes": s.notes,
+                "vehicle_ids_json": s.vehicle_ids_json,
+                "stop_ids_json": s.stop_ids_json,
+                "driver_assignments_json": s.driver_assignments_json,
+            })
+
     db.session.commit()
     return jsonify(s.to_dict())
 
@@ -964,8 +1346,9 @@ def update_scheduled_route(sid):
 @app.route("/api/schedule/<sid>", methods=["GET"])
 @jwt_required()
 def get_scheduled_route(sid):
+    uid = get_jwt_identity()
     s = db.session.get(ScheduledRoute, sid)
-    if not s:
+    if not s or s.user_id != uid:
         return jsonify({"error": "Not found"}), 404
     return jsonify(s.to_dict())
 
@@ -973,9 +1356,10 @@ def get_scheduled_route(sid):
 @app.route("/api/schedule/plans", methods=["GET"])
 @jwt_required()
 def get_all_plans():
-    """Returns all scheduled routes optionally filtered by status."""
+    """Returns master/one-time plans only (excludes child instances)."""
+    uid = get_jwt_identity()
     status_filter = request.args.get("status")
-    q = ScheduledRoute.query
+    q = ScheduledRoute.query.filter(ScheduledRoute.parent_id.is_(None), ScheduledRoute.user_id == uid)
     if status_filter:
         q = q.filter(ScheduledRoute.status == status_filter)
     plans = q.order_by(ScheduledRoute.scheduled_date.desc()).all()
@@ -985,12 +1369,165 @@ def get_all_plans():
 @app.route("/api/schedule/<sid>", methods=["DELETE"])
 @jwt_required()
 def delete_scheduled_route(sid):
+    uid = get_jwt_identity()
     s = db.session.get(ScheduledRoute, sid)
-    if not s:
+    if not s or s.user_id != uid:
         return jsonify({"error": "Not found"}), 404
+    if s.parent_id is None:
+        # Master or one-time: cascade delete all child instances
+        ScheduledRoute.query.filter_by(parent_id=sid).delete()
     db.session.delete(s)
     db.session.commit()
     return jsonify({"message": "Deleted"})
+
+
+# ── Routes: Forecast ─────────────────────────────────────────────────────────
+
+
+@app.route("/api/forecast", methods=["GET"])
+@jwt_required()
+def get_forecast():
+    uid = get_jwt_identity()
+    from datetime import date as date_type, timedelta
+    from sqlalchemy import func as sqlfunc, or_
+
+    period = request.args.get("period", "30d")
+    today = date_type.today()
+    horizon = 90 if period == "90d" else 30
+    end = today + timedelta(days=horizon)
+
+    # All planned instances + one-time plans in the window for this user
+    instances = ScheduledRoute.query.filter(
+        ScheduledRoute.scheduled_date >= today,
+        ScheduledRoute.scheduled_date <= end,
+        ScheduledRoute.status == "planned",
+        ScheduledRoute.user_id == uid,
+        or_(
+            ScheduledRoute.parent_id.isnot(None),
+            ScheduledRoute.recurrence == "none",
+        ),
+    ).order_by(ScheduledRoute.scheduled_date).all()
+
+    # Historical avg miles/minutes per vehicle (scoped to this user)
+    veh_avg_rows = db.session.query(
+        RouteLog.vehicle_id,
+        sqlfunc.avg(RouteLog.miles).label("avg_miles"),
+        sqlfunc.avg(RouteLog.estimated_minutes).label("avg_minutes"),
+    ).filter(RouteLog.user_id == uid).group_by(RouteLog.vehicle_id).all()
+
+    veh_avg = {r.vehicle_id: {"avgMiles": float(r.avg_miles or 0), "avgMinutes": float(r.avg_minutes or 0)}
+               for r in veh_avg_rows}
+
+    fleet_avg_miles = (sum(v["avgMiles"] for v in veh_avg.values()) / len(veh_avg)) if veh_avg else 0
+    fleet_avg_mins  = (sum(v["avgMinutes"] for v in veh_avg.values()) / len(veh_avg)) if veh_avg else 0
+
+    vehicle_lookup = {v.id: v for v in Vehicle.query.filter_by(user_id=uid).all()}
+    driver_lookup  = {d.id: d for d in Driver.query.filter_by(user_id=uid).all()}
+
+    by_vehicle = {}
+    by_driver  = {}
+    timeline   = []
+
+    for inst in instances:
+        vids        = json.loads(inst.vehicle_ids_json) if inst.vehicle_ids_json else []
+        assignments = json.loads(inst.driver_assignments_json) if inst.driver_assignments_json else {}
+
+        for vid in vids:
+            vehicle = vehicle_lookup.get(vid)
+            vname   = vehicle.name if vehicle else vid
+            avg     = veh_avg.get(vid, {"avgMiles": fleet_avg_miles, "avgMinutes": fleet_avg_mins})
+
+            if vid not in by_vehicle:
+                by_vehicle[vid] = {
+                    "vehicleId": vid, "vehicleName": vname,
+                    "runs": 0, "estMiles": 0.0, "estMinutes": 0.0,
+                    "activeDays": set(), "hasHistory": vid in veh_avg,
+                }
+            by_vehicle[vid]["runs"]       += 1
+            by_vehicle[vid]["estMiles"]   += avg["avgMiles"]
+            by_vehicle[vid]["estMinutes"] += avg["avgMinutes"]
+            by_vehicle[vid]["activeDays"].add(inst.scheduled_date.isoformat())
+
+            # Resolve driver: explicit assignment → vehicle default → unassigned
+            did = assignments.get(vid)
+            if not did and vehicle and vehicle.default_driver_id:
+                did = vehicle.default_driver_id
+
+            dname = None
+            if did:
+                driver = driver_lookup.get(did)
+                dname  = driver.name if driver else did
+                if did not in by_driver:
+                    by_driver[did] = {
+                        "driverId": did, "driverName": dname,
+                        "runs": 0, "estMiles": 0.0, "estMinutes": 0.0,
+                        "activeDays": set(),
+                    }
+                by_driver[did]["runs"]       += 1
+                by_driver[did]["estMiles"]   += avg["avgMiles"]
+                by_driver[did]["estMinutes"] += avg["avgMinutes"]
+                by_driver[did]["activeDays"].add(inst.scheduled_date.isoformat())
+
+            timeline.append({
+                "date": inst.scheduled_date.isoformat(),
+                "planId": inst.id,
+                "planTitle": inst.title,
+                "vehicleId": vid,
+                "vehicleName": vname,
+                "driverId": did,
+                "driverName": dname,
+                "estMiles": round(avg["avgMiles"], 1),
+                "hasHistory": vid in veh_avg,
+            })
+
+    # Finalize vehicle rows
+    veh_list = []
+    for vid, vd in by_vehicle.items():
+        vehicle = vehicle_lookup.get(vid)
+        if vehicle:
+            projected = (vehicle.miles_since_oil_change or 0) + vd["estMiles"]
+            threshold = vehicle.oil_change_interval_miles or 5000
+            vd["oilChangeAlert"]               = projected >= threshold
+            vd["projectedMilesSinceOilChange"] = round(projected, 1)
+            vd["oilChangeIntervalMiles"]        = threshold
+        else:
+            vd["oilChangeAlert"] = False
+        vd["activeDays"] = len(vd["activeDays"])
+        vd["estMiles"]   = round(vd["estMiles"], 1)
+        vd["estHours"]   = round(vd["estMinutes"] / 60, 1)
+        veh_list.append(vd)
+    veh_list.sort(key=lambda x: x["estMiles"], reverse=True)
+
+    # Finalize driver rows
+    drv_list = []
+    for did, dd in by_driver.items():
+        dd["activeDays"] = len(dd["activeDays"])
+        dd["estMiles"]   = round(dd["estMiles"], 1)
+        dd["estHours"]   = round(dd["estMinutes"] / 60, 1)
+        drv_list.append(dd)
+    drv_list.sort(key=lambda x: x["estMiles"], reverse=True)
+
+    total_est_miles = sum(v["estMiles"] for v in veh_list)
+    total_est_hours = sum(v["estHours"] for v in veh_list)
+
+    return jsonify({
+        "period": period,
+        "startDate": today.isoformat(),
+        "endDate": end.isoformat(),
+        "summary": {
+            "totalRuns": sum(v["runs"] for v in veh_list),
+            "totalInstances": len(instances),
+            "activeVehicles": len(veh_list),
+            "activeDrivers": len(drv_list),
+            "estTotalMiles": round(total_est_miles, 1),
+            "estTotalHours": round(total_est_hours, 1),
+            "oilChangeAlerts": sum(1 for v in veh_list if v.get("oilChangeAlert")),
+            "hasHistory": bool(veh_avg),
+        },
+        "byVehicle": veh_list,
+        "byDriver": drv_list,
+        "timeline": sorted(timeline, key=lambda x: x["date"]),
+    })
 
 
 # ── Routes: Stats ─────────────────────────────────────────────────────────────
@@ -999,9 +1536,10 @@ def delete_scheduled_route(sid):
 @app.route("/api/stats", methods=["GET"])
 @jwt_required()
 def get_stats():
-    vehicles = Vehicle.query.filter_by(active=True).all()
-    num_stops = DeliveryStop.query.filter_by(active=True).count()
-    num_runs = OptimizationRun.query.count()
+    uid = get_jwt_identity()
+    vehicles = Vehicle.query.filter_by(active=True, user_id=uid).all()
+    num_stops = DeliveryStop.query.filter_by(active=True, user_id=uid).count()
+    num_runs = OptimizationRun.query.filter_by(user_id=uid).count()
     total_fleet_miles = sum(v.total_miles or 0 for v in vehicles)
     return jsonify(
         {
@@ -1017,6 +1555,7 @@ def get_stats():
 @app.route("/api/analytics", methods=["GET"])
 @jwt_required()
 def get_analytics():
+    uid = get_jwt_identity()
     from sqlalchemy import func as sqlfunc
     from datetime import date as date_type, timedelta
 
@@ -1036,13 +1575,8 @@ def get_analytics():
         past_cutoff = None
         future_cutoff = None
 
-    def log_q():
-        q = db.session.query
-        base = RouteLog
-        return q, base
-
     def filtered_scalar(col):
-        q = db.session.query(col)
+        q = db.session.query(col).filter(RouteLog.user_id == uid)
         if past_cutoff:
             q = q.filter(RouteLog.run_date >= past_cutoff)
         return q.scalar() or 0
@@ -1053,7 +1587,7 @@ def get_analytics():
     total_stops_delivered = filtered_scalar(sqlfunc.sum(RouteLog.stops_count))
 
     # ── Planned / anticipated ───────────────────────────────────────────────
-    pq = ScheduledRoute.query.filter_by(status="planned")
+    pq = ScheduledRoute.query.filter_by(status="planned", user_id=uid)
     if future_cutoff:
         pq = pq.filter(ScheduledRoute.scheduled_date >= today,
                        ScheduledRoute.scheduled_date <= future_cutoff)
@@ -1079,12 +1613,12 @@ def get_analytics():
         sqlfunc.sum(RouteLog.estimated_minutes).label("total_minutes"),
         sqlfunc.count(RouteLog.id).label("runs"),
         sqlfunc.sum(RouteLog.stops_count).label("stops"),
-    )
+    ).filter(RouteLog.user_id == uid)
     if past_cutoff:
         veh_q = veh_q.filter(RouteLog.run_date >= past_cutoff)
     veh_rows = veh_q.group_by(RouteLog.vehicle_id, RouteLog.vehicle_name).all()
 
-    vehicle_lookup = {v.id: v for v in Vehicle.query.all()}
+    vehicle_lookup = {v.id: v for v in Vehicle.query.filter_by(user_id=uid).all()}
     by_vehicle = []
     for row in veh_rows:
         v = vehicle_lookup.get(row.vehicle_id)
@@ -1110,7 +1644,7 @@ def get_analytics():
         sqlfunc.sum(RouteLog.estimated_minutes).label("total_minutes"),
         sqlfunc.count(RouteLog.id).label("runs"),
         sqlfunc.sum(RouteLog.stops_count).label("stops"),
-    ).filter(RouteLog.driver_id.isnot(None))
+    ).filter(RouteLog.driver_id.isnot(None), RouteLog.user_id == uid)
     if past_cutoff:
         drv_q = drv_q.filter(RouteLog.run_date >= past_cutoff)
     drv_rows = drv_q.group_by(RouteLog.driver_id, RouteLog.driver_name).all()
@@ -1148,8 +1682,8 @@ def get_analytics():
             "avgStopsPerRun": round((total_stops_delivered or 0) / total_runs, 1) if total_runs else 0,
             "anticipatedMiles": anticipated_miles,
             "anticipatedHours": anticipated_hours,
-            "activeVehicles": Vehicle.query.filter_by(active=True).count(),
-            "activeStops": DeliveryStop.query.filter_by(active=True).count(),
+            "activeVehicles": Vehicle.query.filter_by(active=True, user_id=uid).count(),
+            "activeStops": DeliveryStop.query.filter_by(active=True, user_id=uid).count(),
         },
         "byVehicle": by_vehicle,
         "byDriver": by_driver,
@@ -1185,16 +1719,37 @@ def serve_frontend(path):
 
 
 with app.app_context():
-    db.create_all()
+    try:
+        db.create_all()
+    except Exception:
+        db.session.rollback()
     for stmt in [
         "ALTER TABLE scheduled_routes ADD COLUMN recurrence VARCHAR(20) DEFAULT 'none'",
         "ALTER TABLE scheduled_routes ADD COLUMN stop_ids_json TEXT",
+        "ALTER TABLE scheduled_routes ADD COLUMN parent_id VARCHAR(50)",
+        "ALTER TABLE scheduled_routes ADD COLUMN driver_assignments_json TEXT",
+        "ALTER TABLE scheduled_routes ADD COLUMN user_id VARCHAR(50)",
+        "ALTER TABLE depot ADD COLUMN user_id VARCHAR(50)",
+        "ALTER TABLE vehicles ADD COLUMN user_id VARCHAR(50)",
+        "ALTER TABLE drivers ADD COLUMN user_id VARCHAR(50)",
+        "ALTER TABLE delivery_stops ADD COLUMN user_id VARCHAR(50)",
+        "ALTER TABLE optimization_runs ADD COLUMN user_id VARCHAR(50)",
+        "ALTER TABLE route_logs ADD COLUMN user_id VARCHAR(50)",
+        "ALTER TABLE users ADD COLUMN email_verified BOOLEAN DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN org_name VARCHAR(100)",
+        "ALTER TABLE delivery_stops ADD COLUMN tags TEXT",
+        "ALTER TABLE delivery_stops ADD COLUMN custom_fields TEXT",
     ]:
         try:
             db.session.execute(db.text(stmt))
             db.session.commit()
         except Exception:
             db.session.rollback()
+
+
+@app.errorhandler(429)
+def too_many_requests(e):
+    return jsonify({"error": "Too many attempts. Please wait a minute and try again."}), 429
 
 
 @app.errorhandler(404)
